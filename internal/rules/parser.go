@@ -25,6 +25,7 @@ func ParseConfigBytes(data []byte, path string) (*Config, error) {
 	cfg := &Config{
 		Patterns:   make(map[string]bool),
 		AgentRules: make(map[string]*Config),
+		Clients:    make(map[string]*Client),
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
@@ -32,6 +33,7 @@ func ParseConfigBytes(data []byte, path string) (*Config, error) {
 
 	var currentSection string
 	var currentAgent string
+	var currentClient string
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -49,28 +51,44 @@ func ParseConfigBytes(data []byte, path string) (*Config, error) {
 			switch {
 			case section == "block":
 				currentSection = "block"
+				currentClient = ""
 				// Agent scope is sticky across tier sections (documented in
 				// rules-guide.md): after [agent:x], [block]/[local-only]/
 				// [redact]/[cmd] sections still apply to that agent. Use
 				// [global] to return to global scope.
 			case section == "local-only":
 				currentSection = "local-only"
+				currentClient = ""
 			case section == "redact":
 				currentSection = "redact"
+				currentClient = ""
 			case section == "cmd":
 				currentSection = "cmd"
+				currentClient = ""
 			case section == "redaction.patterns":
 				currentSection = "patterns"
+				currentClient = ""
 			case section == "global":
 				// Explicit return to global scope without changing the section
 				currentAgent = ""
+				currentClient = ""
 			case strings.HasPrefix(section, "agent:"):
 				currentAgent = strings.TrimSpace(section[len("agent:"):])
+				currentClient = ""
 				currentSection = "block" // default section for agent rules
 				if _, ok := cfg.AgentRules[currentAgent]; !ok {
 					cfg.AgentRules[currentAgent] = &Config{
 						Patterns:   make(map[string]bool),
 						AgentRules: make(map[string]*Config),
+					}
+				}
+			case strings.HasPrefix(section, "client:"):
+				currentClient = strings.TrimSpace(section[len("client:"):])
+				currentAgent = ""
+				currentSection = "client"
+				if currentClient != "" {
+					if _, ok := cfg.Clients[currentClient]; !ok {
+						cfg.Clients[currentClient] = &Client{Name: currentClient}
 					}
 				}
 			case section == "preset":
@@ -97,6 +115,19 @@ func ParseConfigBytes(data []byte, path string) (*Config, error) {
 			// "training-data" and any future preset.
 			if val != "" {
 				cfg.Preset = val
+			}
+			continue
+		}
+
+		// Client key lines: "key = <value>" under [client:<name>].
+		if currentSection == "client" {
+			if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
+				k := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(stripInlineComment(parts[1]))
+				val = strings.Trim(val, `"'`)
+				if currentClient != "" && k == "key" {
+					cfg.Clients[currentClient].Key = val
+				}
 			}
 			continue
 		}
@@ -249,11 +280,22 @@ func MergeConfig(parent, child *Config) *Config {
 		parent = &Config{
 			Patterns:   make(map[string]bool),
 			AgentRules: make(map[string]*Config),
+			Clients:    make(map[string]*Client),
 		}
 	}
 	merged := &Config{
 		Patterns:   make(map[string]bool),
 		AgentRules: make(map[string]*Config),
+		Clients:    make(map[string]*Client),
+	}
+
+	// Copy parent clients
+	for name, c := range parent.Clients {
+		merged.Clients[name] = c
+	}
+	// Override with child clients
+	for name, c := range child.Clients {
+		merged.Clients[name] = c
 	}
 
 	// Copy parent patterns

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,6 +43,8 @@ func main() {
 		cmdDryRun(os.Args[2:])
 	case "text":
 		cmdText(os.Args[2:])
+	case "keygen":
+		cmdKeygen(os.Args[2:])
 	case "config":
 		cmdConfig(os.Args[2:])
 	case "install":
@@ -70,6 +73,7 @@ Commands:
   audit          Query the audit log
   classify       Test how a file would be classified
   text           Redact text/file/stdin for safe pasting (clean output)
+  keygen         Generate a gateway client key (gateway mode)
   config         Edit or view configuration
   install        Configure an agent to use Tidegate
   setup-ollama   Configure local Ollama model
@@ -83,6 +87,12 @@ func cmdStart(args []string) {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	port := fs.Int("port", 0, "Gateway port (default: 8842)")
 	preset := fs.String("preset", "", "Rule preset (desktop, server, paranoid)")
+	bind := fs.String("bind", "", `Listen address (default: 127.0.0.1). Use 0.0.0.0 to serve the LAN in gateway mode (pair with --keyfile, [client:*] keys, or --require-key). "localhost" also selects loopback.`)
+	certFile := fs.String("cert", "", "TLS certificate (PEM) — enables HTTPS listener when set with --key")
+	keyFile := fs.String("key", "", "TLS private key (PEM) — enables HTTPS listener when set with --cert")
+	keyfile := fs.String("keyfile", "", "Client keys file for gateway mode: lines of \"name key\" (comments with #). Enables gateway mode.")
+	requireKey := fs.Bool("require-key", false, "Refuse unauthenticated requests even if no client keys are configured (blocks all requests — for testing/lockdown)")
+	allowUnauth := fs.Bool("allow-unauth", false, "Serve on a non-loopback bind WITHOUT client keys (acknowledged risk: anyone on the network can use the gateway)")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*port, *preset)
@@ -91,7 +101,75 @@ func cmdStart(args []string) {
 		os.Exit(1)
 	}
 
+	// CLI overrides for gateway-mode settings (highest priority).
+	if *bind != "" {
+		cfg.Gateway.Bind = *bind
+	}
+	if *certFile != "" {
+		cfg.Gateway.CertFile = *certFile
+	}
+	if *keyFile != "" {
+		cfg.Gateway.KeyFile = *keyFile
+	}
+	var extraClients []config.Client
+	if *keyfile != "" {
+		extraClients, err = config.LoadKeyFile(*keyfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading keyfile: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	// Merge keyfile clients. Same name in config and keyfile: the config
+	// entry must fully REPLACE the keyfile entry — appending would keep
+	// the old keyfile key valid after an operator rotates the key in the
+	// config, defeating the rotation (review finding, deepseek #2).
+	for _, ec := range extraClients {
+		replaced := false
+		for i := range cfg.Clients {
+			if cfg.Clients[i].Name == ec.Name {
+				cfg.Clients[i] = ec
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			cfg.Clients = append(cfg.Clients, ec)
+		}
+	}
+
+	// Gateway mode = listener reachable by other machines. Refuse to serve
+	// unauthenticated on a non-loopback bind unless the operator explicitly
+	// acknowledges it.
+	loopback := isLoopback(cfg.Gateway.Bind)
+	requireAuth := len(cfg.Clients) > 0 || *requireKey
+	if !loopback && !requireAuth && !*allowUnauth {
+		fmt.Fprintf(os.Stderr, "Refusing to bind %s without authentication.\n"+
+			"Gateway mode needs client keys: use --keyfile <file>, or add\n"+
+			"[client:<name>] sections with \"key = <value>\" to the config.\n"+
+			"This protects your cloud API keys from anyone on the network.\n"+
+			"To acknowledge the risk and serve unauthenticated anyway, add --allow-unauth.\n",
+			cfg.Gateway.Bind)
+		os.Exit(1)
+	}
+
 	fmt.Printf("🦞 Tidegate %s starting...\n", Version)
+	if loopback {
+		if len(cfg.Clients) > 0 {
+			fmt.Printf("   Mode: single-machine (loopback) + client keys enabled\n")
+		} else {
+			fmt.Printf("   Mode: single-machine (loopback)\n")
+		}
+	} else {
+		fmt.Printf("   Mode: GATEWAY — serving %s\n", cfg.Gateway.Bind)
+		if len(cfg.Clients) > 0 {
+			fmt.Printf("   Auth: %d client(s), X-Tidegate-Key required\n", len(cfg.Clients))
+		} else if *allowUnauth {
+			fmt.Printf("   Auth: DISABLED (--allow-unauth) — unauthenticated gateway, use only on trusted networks\n")
+		}
+	}
+	if cfg.Gateway.CertFile != "" && cfg.Gateway.KeyFile != "" {
+		fmt.Printf("   TLS: enabled (cert %s)\n", cfg.Gateway.CertFile)
+	}
 	fmt.Printf("   Port: %d\n", cfg.Gateway.Port)
 	fmt.Printf("   Preset: %s\n", cfg.Gateway.Preset)
 	fmt.Printf("   Ollama: %s (%s)\n", cfg.Local.OllamaURL, cfg.Local.OllamaModel)
@@ -122,11 +200,37 @@ func cmdStart(args []string) {
 
 	// Initialize and start proxy
 	srv := proxy.New(router, auditLog, cfg.Gateway.Port)
+	srv.Bind = cfg.Gateway.Bind
+	srv.CertFile = cfg.Gateway.CertFile
+	srv.KeyFile = cfg.Gateway.KeyFile
+	srv.RequireKey = *requireKey
+	for _, c := range cfg.Clients {
+		srv.Clients = append(srv.Clients, proxy.Client{Name: c.Name, Key: c.Key})
+	}
 	fmt.Println()
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Proxy error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// isLoopback reports whether the bind address listens on loopback only.
+// Uses net.ParseIP().IsLoopback() so the whole 127.0.0.0/8 range,
+// ::1, and IPv4-mapped IPv6 loopback are recognized — string matching
+// only caught a few spellings (review finding).
+func isLoopback(bind string) bool {
+	switch bind {
+	case "", "localhost", "loopback":
+		return true
+	}
+	host := bind
+	if h, _, err := net.SplitHostPort(bind); err == nil {
+		host = h // tolerate "127.0.0.1:8842" style input
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func cmdAudit(args []string) {

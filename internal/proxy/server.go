@@ -1,18 +1,22 @@
 // Package proxy implements the Tidegate HTTP reverse proxy.
-// It listens on localhost, intercepts LLM API requests, routes them through
-// the classifier/redactor/router, and forwards to the upstream cloud API.
+// It listens on localhost (or a LAN address in gateway mode), intercepts LLM
+// API requests, routes them through the classifier/redactor/router, and
+// forwards to the upstream cloud API.
 //
-// Local connection: plain HTTP (no TLS needed for localhost).
+// Local connection: plain HTTP on loopback; bind to a LAN address for
+// gateway mode (pair with client keys and/or TLS).
 // Upstream connection: HTTPS (TLS terminated by cloud provider).
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +70,25 @@ type Server struct {
 	Router   *route.Router
 	AuditLog *audit.Log
 	Port     int
+	// Bind address. Empty or "localhost" → 127.0.0.1; "0.0.0.0" → all
+	// interfaces (gateway mode). Defaults to loopback when unset.
+	Bind string
+	// Clients authorized in gateway mode (pre-shared keys). Empty = auth
+	// disabled (single-machine mode, loopback default).
+	Clients []Client
+	// RequireKey rejects ALL requests when no client keys are configured
+	// (--require-key lockdown mode). With clients configured this is
+	// implicitly true.
+	RequireKey bool
+	// TLS certificate and key paths. Both set = HTTPS listener.
+	CertFile string
+	KeyFile  string
+}
+
+// Client is one authorized gateway client (pre-shared key).
+type Client struct {
+	Name string
+	Key  string
 }
 
 // New creates a proxy Server.
@@ -77,28 +100,107 @@ func New(router *route.Router, auditLog *audit.Log, port int) *Server {
 	}
 }
 
-// Start begins listening on localhost:port. Blocks until the server stops.
+// GatewayClient is the header constant carrying a gateway client's
+// pre-shared key. The header is stripped before forwarding upstream.
+const GatewayClientHeader = "X-Tidegate-Key"
+
+// clientByKey resolves a pre-shared key to its client. The loop compares
+// against EVERY configured key — no early return — so the number of
+// comparisons (and thus request timing) is independent of which key, if
+// any, matches. Early exit would let an attacker learn how far down the
+// list a guessed key got (review finding: position-dependent timing).
+// Duplicate keys are a config error; with them, the LAST matching entry
+// wins (deterministic, and consistent with later-config-wins precedence).
+func (s *Server) clientByKey(key string) (Client, bool) {
+	var match Client
+	found := false
+	for _, c := range s.Clients {
+		if subtle.ConstantTimeCompare([]byte(c.Key), []byte(key)) == 1 {
+			match = c
+			found = true
+		}
+	}
+	return match, found
+}
+
+// RequireKey, when true, rejects all requests even if no client keys are
+// configured (--require-key: lockdown/testing mode). authorize consults it
+// via the Server field.
+func (s *Server) authorize(r *http.Request) (string, bool) {
+	if len(s.Clients) == 0 {
+		return "", !s.RequireKey
+	}
+	key := r.Header.Get(GatewayClientHeader)
+	if key == "" {
+		return "", false
+	}
+	client, ok := s.clientByKey(key)
+	if !ok {
+		return "", false
+	}
+	return client.Name, true
+}
+
+// Start begins listening. Blocks until the server stops.
+// The listener is created with net.Listen first, so bind errors (address
+// in use, permission denied) surface immediately instead of being deferred.
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.HealthCheck)
 	mux.HandleFunc("/", s.handleProxy)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", s.Port)
+	addr := s.listenAddr()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
 	log.Printf("Tidegate proxy listening on %s", addr)
 
 	server := &http.Server{
-		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
-	return server.ListenAndServe()
+	if s.CertFile != "" && s.KeyFile != "" {
+		return server.ServeTLS(ln, s.CertFile, s.KeyFile)
+	}
+	return server.Serve(ln)
+}
+
+// listenAddr resolves the bind address to a host:port string.
+// Empty, "localhost", or "loopback" → 127.0.0.1 (backward compatible).
+func (s *Server) listenAddr() string {
+	host := s.Bind
+	switch host {
+	case "", "localhost", "loopback":
+		host = "127.0.0.1"
+	}
+	port := s.Port
+	if port == 0 {
+		port = 8842
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // handleProxy is the main request handler.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	// Gateway mode: authenticate the client via pre-shared key. The key
+	// header is stripped below, so it never reaches the upstream API.
+	// RequireKey (lockdown) trips the gate even with zero clients.
+	if len(s.Clients) > 0 || s.RequireKey {
+		clientName, ok := s.authorize(r)
+		if !ok {
+			log.Printf("unauthorized request from %s", r.RemoteAddr)
+			http.Error(w, "unauthorized: missing or invalid "+GatewayClientHeader+" header", http.StatusUnauthorized)
+			return
+		}
+		// The authenticated client identity is authoritative: it cannot
+		// be spoofed via the X-Tidegate-Agent header.
+		r.Header.Set("X-Tidegate-Agent", clientName)
+	}
+
 	// Identify the agent — check custom header first, then fall back to
 	// User-Agent-based auto-detection for agents that don't set X-Tidegate-Agent.
 	agent := r.Header.Get("X-Tidegate-Agent")
@@ -286,11 +388,12 @@ func (s *Server) resolveUpstream(path string) (host string, provider string) {
 }
 
 // isFilteredHeader returns true for headers that should not be forwarded
-// to the upstream API: Tidegate-internal headers, hop-by-hop headers
-// (RFC 7230 section 6.1), and per-connection headers like Cookie and Host.
+// to the upstream API: Tidegate-internal headers (agent identity and the
+// gateway client key), hop-by-hop headers (RFC 7230 §6.1), and per-connection
+// headers like Cookie and Host.
 func isFilteredHeader(headerName string) bool {
 	// Tidegate-internal
-	if headerName == "X-Tidegate-Agent" {
+	if headerName == "X-Tidegate-Agent" || headerName == GatewayClientHeader {
 		return true
 	}
 	// Per-connection / control headers

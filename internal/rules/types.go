@@ -78,6 +78,12 @@ type RuleSet struct {
 	AgentOverrides map[string]*RuleSet // per-agent rule overrides (by agent name)
 }
 
+// Client is a named gateway client with a pre-shared key (gateway mode).
+type Client struct {
+	Name string
+	Key  string
+}
+
 // Config represents a parsed configuration file (one layer of the stack).
 type Config struct {
 	Blocks     []string           // paths to block
@@ -86,5 +92,6 @@ type Config struct {
 	Cmds       []CmdRuleSpec      // command rules from [cmd] sections
 	Patterns   map[string]bool    // redaction pattern toggles
 	AgentRules map[string]*Config // per-agent sections
+	Clients    map[string]*Client // gateway-mode clients ([client:<name>] sections)
 	Preset     string
 }

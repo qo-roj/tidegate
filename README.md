@@ -71,6 +71,8 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 
 ## Features
 
+- **Gateway mode** — run one Tidegate on a server/Raspberry Pi for the whole LAN (`--bind 0.0.0.0` + client keys); any-OS clients just point their base URL at it, no local install — see [Gateway Mode](docs/gateway-mode.md)
+- **Client authentication** — per-device pre-shared keys (`X-Tidegate-Key`, `tidegate keygen --add <name>`); key identity overrides the spoofable agent header; keys never reach cloud providers
 - **Pattern redaction** — IPv4/IPv6, emails, phone numbers, API keys (GitHub, OpenAI, AWS, Anthropic, Google, Stripe, Slack, GitLab), JWTs, private keys, MAC addresses, credit cards, SSNs, database connection strings
 - **`tidegate text`** — one-off redaction of text, files, or piped stdin for safe pasting into any web UI (ChatGPT, chatbots, tickets); `--out` writes a file, `--summary` lists what was caught
 - **Agent auto-detection** — identifies agents by `X-Tidegate-Agent` header or `User-Agent` string (Claude Code, Codex, OpenCode, Hermes, Cursor, Aider, Cline, GitHub Copilot, Grok CLI)
@@ -80,6 +82,7 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 - **Presets** — desktop, server, paranoid, training-data (PII-safe fine-tuning) configurations out of the box
 - **Per-project rules** — `.tidegate.conf` in any project root
 - **Per-agent rules** — different agents get different access levels
+- **TLS listener** — optional `--cert`/`--key` for HTTPS on untrusted networks
 - **Docker support** — official `docker compose` setup with Ollama sidecar
 - **CI/CD** — GitHub Actions with automated testing and cross-platform release binaries
 - **Single binary** — Go, no runtime dependencies, cross-platform
@@ -87,6 +90,7 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Gateway Mode](docs/gateway-mode.md)
 - [Threat Model](docs/threat-model.md)
 - [Rules Guide](docs/rules-guide.md)
 - [Agent Setup](docs/agent-setup.md)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -32,8 +33,22 @@ var trainingDataConf embed.FS
 // Gateway holds the runtime configuration for the Tidegate gateway.
 type Gateway struct {
 	Port     int
+	Bind     string
 	LogLevel string
 	Preset   string
+	// Gateway mode: when true, the proxy requires a valid client key on
+	// every request. Enabled automatically when any client key is
+	// configured (config file, --keyfile, or --require-key).
+	RequireKey bool
+	// TLS certificate and key (pem). Empty = plain HTTP.
+	CertFile string
+	KeyFile  string
+}
+
+// Client is one authorized gateway client (pre-shared key).
+type Client struct {
+	Name string
+	Key  string
 }
 
 // Cloud holds cloud provider configuration.
@@ -54,6 +69,7 @@ type AppConfig struct {
 	Gateway Gateway
 	Cloud   Cloud
 	Local   Local
+	Clients []Client // gateway-mode clients, in config order
 	RuleSet *rules.RuleSet
 }
 
@@ -68,6 +84,7 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	cfg := &AppConfig{
 		Gateway: Gateway{
 			Port:     8842,
+			Bind:     "127.0.0.1",
 			LogLevel: "info",
 			Preset:   "desktop",
 		},
@@ -149,6 +166,43 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 		cfg.Gateway.Port = cliPort
 	}
 
+	// [gateway] settings and [client:<name>] keys from user + project config.
+	// The rules parser skips [gateway] sections (they carry no rule data),
+	// so gateway key/values are read from the raw files here. Later files
+	// (project) override earlier (user), matching preset-selection order.
+	if userCfg != nil {
+		applyGatewayFile(cfg, userConfigPath)
+		for _, name := range sortedClientNames(userCfg) {
+			cfg.Clients = append(cfg.Clients, Client{
+				Name: name,
+				Key:  userCfg.Clients[name].Key,
+			})
+		}
+	}
+	if projCfg != nil {
+		applyGatewayFile(cfg, ".tidegate.conf")
+		for _, name := range sortedClientNames(projCfg) {
+			// Replace a same-named user-layer client (project wins).
+			replaced := false
+			for i := range cfg.Clients {
+				if cfg.Clients[i].Name == name {
+					cfg.Clients[i].Key = projCfg.Clients[name].Key
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				cfg.Clients = append(cfg.Clients, Client{
+					Name: name,
+					Key:  projCfg.Clients[name].Key,
+				})
+			}
+		}
+	}
+
+	// Gateway mode activates when any client key is configured.
+	cfg.Gateway.RequireKey = len(cfg.Clients) > 0
+
 	// Build the rule set with cross-layer block protection
 	cfg.RuleSet = rules.BuildRuleSetLayered(layers)
 
@@ -158,6 +212,106 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	cfg.Cloud.XAIKey = os.Getenv("XAI_API_KEY")
 
 	return cfg, nil
+}
+
+// applyGatewayFile reads [gateway] key/value settings from a config file and
+// applies them to cfg. Later calls (project config) override earlier (user).
+// Keys: bind, cert, key (paths), port, log_level.
+func applyGatewayFile(cfg *AppConfig, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	inGateway := false
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inGateway = strings.TrimSpace(line[1:len(line)-1]) == "gateway"
+			continue
+		}
+		if !inGateway {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(stripHashComment(parts[1]))
+		// Tolerate quoted values: bind = "0.0.0.0" must not carry the
+		// quotes into net.Listen (review finding).
+		v = strings.Trim(v, `"'`)
+		switch k {
+		case "bind":
+			cfg.Gateway.Bind = v
+		case "port":
+			if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+				cfg.Gateway.Port = p
+			}
+		case "log_level":
+			cfg.Gateway.LogLevel = v
+		case "cert", "cert_file", "tls_cert":
+			cfg.Gateway.CertFile = v
+		case "key", "key_file", "tls_key":
+			cfg.Gateway.KeyFile = v
+		}
+	}
+}
+
+// stripHashComment removes a trailing " #..." comment from a value.
+func stripHashComment(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '#' && (i == 0 || s[i-1] == ' ' || s[i-1] == '\t') {
+			return strings.TrimSpace(s[:i])
+		}
+	}
+	return s
+}
+
+// sortedClientNames returns the client names of a rules config in sorted
+// order, so AppConfig.Clients is deterministic across runs.
+func sortedClientNames(cfg *rules.Config) []string {
+	names := make([]string, 0, len(cfg.Clients))
+	for name := range cfg.Clients {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// LoadKeyFile loads gateway client keys from a keyfile. Format:
+//
+//	name key
+//	name2 key2
+//
+// Lines: whitespace-separated, comments (#) and blank lines ignored.
+// Returns an error if any non-comment line lacks a name and key.
+func LoadKeyFile(path string) ([]Client, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading keyfile: %w", err)
+	}
+	var clients []Client
+	for _, raw := range strings.Split(string(data), "\n") {
+		// Strip inline comments so "phone abc # old key" still parses
+		// as two fields (review finding).
+		if idx := strings.IndexAny(raw, "#;"); idx >= 0 {
+			raw = raw[:idx]
+		}
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("keyfile line %q: want \"name key\"", line)
+		}
+		clients = append(clients, Client{Name: fields[0], Key: fields[1]})
+	}
+	return clients, nil
 }
 
 // loadPreset returns the embedded preset config data for the given preset name.
