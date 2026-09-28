@@ -5,6 +5,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/qo-roj/tidegate/internal/audit"
 
 	"github.com/qo-roj/tidegate/internal/route"
 	"github.com/qo-roj/tidegate/internal/rules"
@@ -243,5 +246,51 @@ func TestClientByKeyScansAllClients(t *testing.T) {
 	}
 	if _, ok := srv.clientByKey("other"); !ok {
 		t.Error("expected match for trailing client")
+	}
+}
+
+// An unknown path prefix (probe, misconfigured client) must still produce an
+// audit row: a gateway exposed beyond loopback should never have silent
+// rejections.
+func TestUnknownPathPrefixIsAudited(t *testing.T) {
+	srv, _ := makeGatewayTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/definitely-not-a-provider/v1/chat", strings.NewReader("probe"))
+	req.Header.Set(GatewayClientHeader, "key-phone-123")
+	rec := httptest.NewRecorder()
+	srv.handleProxy(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502, got %d", rec.Code)
+	}
+	// The audit writer is asynchronous — poll briefly for the row.
+	var (
+		entries []audit.Entry
+		err     error
+	)
+	deadline := time.Now().Add(5 * time.Second) // 5s poll ceiling (was 3s — marginal under CI load, review 2026-09-28)
+	for time.Now().Before(deadline) {
+		entries, err = srv.AuditLog.Query("", time.Now().Add(-time.Minute), 10)
+		if err == nil && len(entries) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("audit query: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.Notes, "unknown API path prefix") {
+			found = true
+			if e.Agent != "phone" {
+				t.Errorf("audit agent = %q, want the authenticated client name", e.Agent)
+			}
+			if e.Tier != "blocked" {
+				t.Errorf("audit tier = %q, want blocked", e.Tier)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no audit entry recorded for the rejected request: %+v", entries)
 	}
 }

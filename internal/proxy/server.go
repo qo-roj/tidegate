@@ -208,9 +208,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		agent = detectAgent(r)
 	}
 
-	// Determine the upstream provider from the path prefix
+	// Determine the upstream provider from the path prefix. The audit log
+	// needs the provider name, but a missing/unknown prefix is still
+	// audited: a request that fails here is exactly the kind of thing an
+	// operator wants to see (probe, misconfigured client, leaked port).
 	upstreamHost, provider := s.resolveUpstream(r.URL.Path)
 	if upstreamHost == "" {
+		if s.AuditLog != nil {
+			s.AuditLog.Record(audit.Entry{
+				Agent:    agent,
+				Provider: "(unknown)",
+				Action:   "reject",
+				Target:   r.URL.Path,
+				Tier:     "blocked",
+				Notes:    "rejected: unknown API path prefix",
+			})
+		}
 		http.Error(w, "unknown API path prefix", http.StatusBadGateway)
 		return
 	}

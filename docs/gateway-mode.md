@@ -126,7 +126,17 @@ clients must skip verification (curl `-k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`
   the client's key-name IS its agent identity in the rule engine.
 - **Ollama must be reachable from the gateway** — point it at a real model
   server (`[local] ollama_url = http://r730:11434`), not localhost on the
-  Pi, or `local-only` content gets blocked.
+  Pi, or `local-only` content gets blocked. `[local]` keys (`ollama_url`,
+  `ollama_model`) are read from user and project config files (v0.6.1 —
+  previously they were advertised but silently ignored).
+- **`local-only` becomes `fleet-only` when ollama_url points off-host.**
+  If `[local] ollama_url` names another machine (e.g. a LAN model server
+  over Tailscale), every request classified `local-only` is sent to that
+  host in plain text — the content leaves the gateway. That is the point of
+  the setting, but it means "local" is wherever the model server lives.
+  Tidegate prints a startup warning when ollama_url is not a loopback or
+  LAN address; treat local-only content as leaving the gateway whenever
+  ollama_url points off-host (VPS deployment lesson, 2026-09-28).
 - **Client `.tidegate.conf` does not apply** — project-local rules are read
   from the gateway's working directory, not the client's. Put shared
   policy in the gateway's user config.

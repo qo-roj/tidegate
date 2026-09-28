@@ -304,3 +304,36 @@ func TestLoadKeyFileInlineComments(t *testing.T) {
 		t.Errorf("client 1 = %+v", clients[1])
 	}
 }
+
+// [local] settings must be read from the config file: the shipped `server`
+// preset classifies /var/log/** as local-only, so pointing ollama_url at a
+// reachable model server is the difference between log analysis being
+// summarised and being BLOCKED.
+func TestApplyGatewayFileLocalSection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tidegate.conf")
+	content := `
+[gateway]
+bind = 127.0.0.1
+
+[local]
+ollama_url = http://100.105.40.95:11434
+ollama_model = "llama3.1:8b"
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &AppConfig{}
+	cfg.Local.OllamaURL = "http://localhost:11434"
+	applyGatewayFile(cfg, path)
+	if cfg.Local.OllamaURL != "http://100.105.40.95:11434" {
+		t.Errorf("ollama_url = %q, want the config value", cfg.Local.OllamaURL)
+	}
+	if cfg.Local.OllamaModel != "llama3.1:8b" {
+		t.Errorf("ollama_model = %q, want llama3.1:8b", cfg.Local.OllamaModel)
+	}
+	// A [local] section must not disturb gateway settings.
+	if cfg.Gateway.Bind != "127.0.0.1" {
+		t.Errorf("bind = %q, want 127.0.0.1", cfg.Gateway.Bind)
+	}
+}

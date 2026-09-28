@@ -214,25 +214,29 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	return cfg, nil
 }
 
-// applyGatewayFile reads [gateway] key/value settings from a config file and
-// applies them to cfg. Later calls (project config) override earlier (user).
-// Keys: bind, cert, key (paths), port, log_level.
+// applyGatewayFile reads [gateway] and [local] key/value settings from a config
+// file and applies them to cfg. Later calls (project config) override earlier
+// (user). Keys: bind, cert, key (paths), port, log_level; local: ollama_url,
+// ollama_model.
+//
+// The rules parser skips these sections (they carry no rule data), so they are
+// read from the raw file here. ollama_url matters in practice: the shipped
+// `server` preset classifies /var/log/** as local-only, so a gateway whose
+// Ollama URL points at a non-existent localhost:11434 BLOCKS all log analysis
+// instead of summarising it.
 func applyGatewayFile(cfg *AppConfig, path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
-	inGateway := false
+	section := ""
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			inGateway = strings.TrimSpace(line[1:len(line)-1]) == "gateway"
-			continue
-		}
-		if !inGateway {
+			section = strings.TrimSpace(line[1 : len(line)-1])
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -244,19 +248,36 @@ func applyGatewayFile(cfg *AppConfig, path string) {
 		// Tolerate quoted values: bind = "0.0.0.0" must not carry the
 		// quotes into net.Listen (review finding).
 		v = strings.Trim(v, `"'`)
-		switch k {
-		case "bind":
-			cfg.Gateway.Bind = v
-		case "port":
-			if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
-				cfg.Gateway.Port = p
+		if v == "" {
+			// Empty values never override: a blank `ollama_url =` in a
+			// later file must not wipe a valid earlier value (dual-model
+			// review 2026-09-28; for gateway keys this also prevents an
+			// accidental `bind =` from clearing to "" = all interfaces).
+			continue
+		}
+		switch section {
+		case "gateway":
+			switch k {
+			case "bind":
+				cfg.Gateway.Bind = v
+			case "port":
+				if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+					cfg.Gateway.Port = p
+				}
+			case "log_level":
+				cfg.Gateway.LogLevel = v
+			case "cert", "cert_file", "tls_cert":
+				cfg.Gateway.CertFile = v
+			case "key", "key_file", "tls_key":
+				cfg.Gateway.KeyFile = v
 			}
-		case "log_level":
-			cfg.Gateway.LogLevel = v
-		case "cert", "cert_file", "tls_cert":
-			cfg.Gateway.CertFile = v
-		case "key", "key_file", "tls_key":
-			cfg.Gateway.KeyFile = v
+		case "local":
+			switch k {
+			case "ollama_url":
+				cfg.Local.OllamaURL = v
+			case "ollama_model":
+				cfg.Local.OllamaModel = v
+			}
 		}
 	}
 }
