@@ -152,12 +152,17 @@ func DefaultPatterns() []*Pattern {
 		// Phone — international form (+ prefix) and NANP form (3-3-4 with
 		// optional separators). Bare 10-digit strings are deliberately
 		// covered: for a redaction tool a missed number is worse than a
-		// flagged order-ID. Word boundaries keep it from matching inside
-		// longer digit runs; IPs/dates/SSNs don't fit the 3-3-4 shape.
+		// flagged order-ID. Structure-anchored (Group 1 = the number, the
+		// leading context char survives): the match must start at a line
+		// start or after a char that is NOT word/./:/- , so digit runs
+		// glued to decimal points or time separators can never match —
+		// the 2026-10-01 report had Apache timestamps
+		// `15:07:51.712345 2026` eaten as a NANP number (712-345-2026).
 		{
 			Name:     "phone",
-			Regex:    regexp.MustCompile(`(?:\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{3,5}[\s.\-]?\d{3,5}|\(?\b\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b)`),
+			Regex:    regexp.MustCompile(`(?m)(?:^|[^\w.:\-])(\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{3,5}[\s.\-]?\d{3,5}|\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4})\b`),
 			Category: "PHONE",
+			Group:    1,
 			Enabled:  true,
 		},
 	}
@@ -262,6 +267,35 @@ func ExtendedPatterns() []*Pattern {
 			Group:    1,
 			Enabled:  false,
 		},
+
+		// docroot hostname — structure-anchored (Group 1 = hostname
+		// segment). Apache/Plesk DocumentRoot paths use the vhost's
+		// hostname as a path segment: /var/www/<host>/htdocs,
+		// /var/www/vhosts/<host>/, /srv/www/<host>/. Requiring the
+		// trailing slash keeps plain files (…/index.html) from matching.
+		// Found live by Earl 2026-10-01: `client denied by server
+		// configuration: /var/www/myhost.com/htdocs/x.php` leaked the
+		// vhost in path position (2026-10-01).
+		{
+			Name:     "docroot_hostname",
+			Regex:    regexp.MustCompile(`(?m)(?i:\bvar/www(?:/vhosts)?/|\bsrv/www/)([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})/`),
+			Category: "HOST",
+			Group:    1,
+			Enabled:  false,
+		},
+
+		// url_hostname — structure-anchored (Group 1 = host part). Any
+		// scheme:// URL: referer fields in access logs, curl commands in
+		// error logs, api endpoints in config dumps. Scheme, port and path
+		// survive; only the host is tokenized. userinfo (user:pass@) stays
+		// out of the group (it is its own credential pattern's business).
+		{
+			Name:     "url_hostname",
+			Regex:    regexp.MustCompile(`(?m)(?:[a-zA-Z][a-zA-Z0-9+.\-]*://)(?:[^\s/@]*@)?([a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,})(?::\d{1,5})?(?:[/?#:]|\s)`),
+			Category: "HOST",
+			Group:    1,
+			Enabled:  false,
+		},
 	}
 	return append(DefaultPatterns(), extra...)
 }
@@ -276,6 +310,7 @@ var patternNames = []string{
 	"ipv4", "ipv6", "mac_address", "database_connection", "credit_card", "ssn_us",
 	"phone", "hostname_internal", "iban", "passport", "high_entropy_secret",
 	"syslog_hostname", "passwd_username", "accesslog_hostname",
+	"docroot_hostname", "url_hostname",
 }
 
 // AllPatterns returns every known pattern (defaults plus extended). Extended

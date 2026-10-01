@@ -123,6 +123,8 @@ Built-in patterns:
 | `syslog_hostname` | Hostnames in syslog-style timestamped lines with process tag (structure-anchored: timestamp and process stay, hostname tokenized) | `Sep  3 17:54:01 web01 sshd[1]: …` | `Sep  3 17:54:01 [TG:HOST:1] sshd[1]: …` |
 | `passwd_username` | Account names in passwd/shadow-style lines (structure-anchored: field layout stays, name tokenized) | `alice:x:1000:1000:…` | `[TG:USER:1]:x:1000:1000:…` |
 | `accesslog_hostname` | Virtual host in Apache/nginx combined access logs (structure-anchored: `vhost[:port] client - - [timestamp]`; port, client and timestamp stay, vhost tokenized). Default-on since v0.6.2 — found live: vhost leaked while client IP was redacted | `myhost.com:443 1.2.3.4 - - [01/Oct/2026:14:44:22 +0200] …` | `[TG:HOST:1]:443 1.2.3.4 - - [01/Oct/2026:14:44:22 +0200] …` |
+| `docroot_hostname` | Vhost hostname as a DocumentRoot path segment (structure-anchored on `/var/www[/vhosts]/<host>/` or `/srv/www/<host>/`; the rest of the path stays). Default-on since v0.6.3 — found live: Apache error log leaked the vhost in `client denied by server configuration: /var/www/<host>/htdocs/…` | `/var/www/myhost.com/htdocs/x.php` | `/var/www/[TG:HOST:1]/htdocs/x.php` |
+| `url_hostname` | Host part of any `scheme://` URL (structure-anchored: scheme, port, path, userinfo stay; host tokenized) — referer fields, curl commands, endpoint dumps. Default-on since v0.6.3 | `curl https://api.mycorp.net:8443/health` | `curl https://[TG:HOST:1]:8443/health` |
 
 Pattern toggles live in `[redaction.patterns]` (e.g. `syslog_hostname = false`); defaults are set in `rules/defaults.conf`. Extended patterns (private IPs, internal hostnames, IBAN, passport, high-entropy secrets) are opt-in per preset.
 

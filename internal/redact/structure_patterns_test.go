@@ -176,6 +176,167 @@ func TestAccesslogHostnameIPVhostAttribution(t *testing.T) {
 	}
 }
 
+// docroot_hostname: hostname as a DocumentRoot path segment. Found live by
+// Earl (2026-10-01): Apache error log `client denied by server
+// configuration: /var/www/myhost.com/htdocs/e424591d45b4.php` leaked the
+// vhost in path position.
+func TestDocrootHostnameRedacts(t *testing.T) {
+	r := newTestRedactor("docroot_hostname")
+	in := "[Thu Oct 01 15:07:51.712345 2026] [access_compat:error] [pid 2283163:tid 2283163] [client 203.0.113.9:60650] AH01797: client denied by server configuration: /var/www/myhost.com/htdocs/e424591d45b4.php\n"
+	out, s := r.Redact(in)
+	if !strings.Contains(out, "/var/www/[TG:HOST:1]/htdocs/e424591d45b4.php") {
+		t.Errorf("docroot hostname not redacted: %q", out)
+	}
+	if strings.Contains(out, "myhost.com") {
+		t.Errorf("hostname survived: %q", out)
+	}
+	if !strings.Contains(out, "[Thu Oct 01 15:07:51.712345 2026]") {
+		t.Errorf("timestamp context altered: %q", out)
+	}
+	if s["docroot_hostname"] != 1 {
+		t.Errorf("summary = %v, want docroot_hostname: 1", s)
+	}
+	restored := r.Restore(out)
+	if restored != in {
+		t.Errorf("restore round-trip failed:\n got %q\nwant %q", restored, in)
+	}
+}
+
+func TestDocrootHostnameVariants(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plesk vhosts", "failed to open /var/www/vhosts/myhost.com/httpdocs/index.php",
+			"/var/www/vhosts/[TG:HOST:1]/httpdocs/index.php"},
+		{"srv www", "cannot read /srv/www/shop.example.net/htdocs/logo.png",
+			"/srv/www/[TG:HOST:1]/htdocs/logo.png"},
+		{"subdomain", "open() /var/www/api.mycorp.de/htdocs/health failed",
+			"/var/www/[TG:HOST:1]/htdocs/health failed"},
+	}
+	for _, tc := range cases {
+		r := newTestRedactor("docroot_hostname")
+		out, _ := r.Redact(tc.in + "\n")
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.name, out, tc.want)
+		}
+	}
+}
+
+// Files directly under the webroot must not match (the trailing slash is
+// what keeps plain filenames out).
+func TestDocrootHostnameProseSafety(t *testing.T) {
+	r := newTestRedactor("docroot_hostname")
+	for _, in := range []string{
+		"cat /var/www/index.html",
+		"see /var/www/ for the docroot layout",
+		"the file is /var/www/e424591d45b4.php",
+		"discussed var/www paths in the docs today",
+	} {
+		out, s := r.Redact(in + "\n")
+		if out != in+"\n" || len(s) != 0 {
+			t.Errorf("prose modified: %q -> %q (%v)", in, out, s)
+		}
+	}
+}
+
+// url_hostname: host part of any scheme:// URL — referer fields, curl
+// commands, endpoint dumps. The next leak class after the path-position
+// vhost: access-log referers routinely carry the site's own URL.
+func TestURLHostnameRedacts(t *testing.T) {
+	r := newTestRedactor("url_hostname")
+	in := `203.0.113.7 - - [01/Oct/2026:14:44:22 +0200] "GET /en/ HTTP/1.1" 200 512 "https://myhost.com/en/?ref=x" "Mozilla/5.0"` + "\n"
+	out, s := r.Redact(in)
+	if !strings.Contains(out, "\"https://[TG:HOST:1]/en/?ref=x\"") {
+		t.Errorf("URL host not redacted: %q", out)
+	}
+	if s["url_hostname"] != 1 {
+		t.Errorf("summary = %v, want url_hostname: 1", s)
+	}
+	restored := r.Restore(out)
+	if restored != in {
+		t.Errorf("restore round-trip failed:\n got %q\nwant %q", restored, in)
+	}
+}
+
+func TestURLHostnameVariants(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"port survives", "curl -s https://api.mycorp.internal:8443/health",
+			"curl -s https://[TG:HOST:1]:8443/health"},
+		{"http scheme", "fetch http://cdn.example.net/js/app.js now",
+			"fetch http://[TG:HOST:1]/js/app.js now"},
+		{"userinfo stays out of group", "clone https://user@bitbucket.example.org/repo.git",
+			"clone https://user@[TG:HOST:1]/repo.git"},
+		{"ftp scheme", "get ftp://files.example.com/pub/data.tar.gz",
+			"get ftp://[TG:HOST:1]/pub/data.tar.gz"},
+	}
+	for _, tc := range cases {
+		r := newTestRedactor("url_hostname")
+		out, _ := r.Redact(tc.in + "\n")
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.name, out, tc.want)
+		}
+	}
+}
+
+// Bare domain names in prose (not preceded by a scheme://) must not match.
+func TestURLHostnameProseSafety(t *testing.T) {
+	r := newTestRedactor("url_hostname")
+	for _, in := range []string{
+		"visit myhost.com for details",
+		"the server shop.example.net is down",
+		"see example.org/docs",
+		"email me at bob@corp.example.com", // email pattern's business
+	} {
+		out, s := r.Redact(in + "\n")
+		if out != in+"\n" || len(s) != 0 {
+			t.Errorf("prose modified: %q -> %q (%v)", in, out, s)
+		}
+	}
+}
+
+// Phone must not eat log timestamps: `15:07:51.712345 2026` parsed as NANP
+// 712-345-2026 (Earl's 2026-10-01 error-log report). The leading-context
+// anchoring (line start or a non-word/non-separator char) prevents digit
+// runs glued to `.`/`:`/`-` from matching.
+func TestPhoneDoesNotEatTimestamps(t *testing.T) {
+	cases := []string{
+		"[Thu Oct 01 15:07:51.712345 2026] [access_compat:error] AH01797",
+		"[2026-10-01T15:07:51.712345+02:00] something happened",
+		"duration: 1.234567 seconds",
+		"[pid 2283163:tid 2283163] worker exited",
+	}
+	for _, in := range cases {
+		r := newTestRedactor("phone") // fresh per case
+		out, s := r.Redact(in + "\n")
+		if strings.Contains(out, "[TG:PHONE:") {
+			t.Errorf("timestamp eaten: %q -> %q", in, out)
+		}
+		if len(s) != 0 {
+			t.Errorf("false positive phone: %q -> %q (%v)", in, out, s)
+		}
+	}
+	// The original phone forms still redact (regression guard).
+	for _, in := range []string{
+		"call 555-123-4567 now",
+		"call 5551234567 now",
+		"call (555) 123-4567 now",
+		"call +1 (555) 123-4567 now",
+		"call +49 170 1234567 now",
+	} {
+		r := newTestRedactor("phone")
+		out, s := r.Redact(in + "\n")
+		if !strings.Contains(out, "[TG:PHONE:1]") || s["phone"] != 1 {
+			t.Errorf("phone form lost: %q -> %q (%v)", in, out, s)
+		}
+	}
+}
+
 func TestSyslogHostnameIgnoresMidLineTimestamps(t *testing.T) {
 	r := newTestRedactor("syslog_hostname")
 	out, s := r.Redact("The meeting notes say 17:54:01 himbeerkuchen and nothing else.")
