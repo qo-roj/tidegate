@@ -236,6 +236,32 @@ func ExtendedPatterns() []*Pattern {
 			// Not in default set: only redact when the file itself looks like
 			// passwd; otherwise every "user:pass" colon pair in prose matches.
 		},
+
+		// Access-log vhost — structure-anchored (Group 1 = vhost). Apache /
+		// nginx combined-format logs with a leading virtual host have the
+		// rigid shape `vhost[:port] client - - [dd/Mon/yyyy:HH:MM:SS +zzzz]`.
+		// A bare hostname regex would false-positive on ordinary words and
+		// public-looking domains in prose; the client field, the two dash
+		// placeholders and the bracketed timestamp together are a shape prose
+		// never produces, so only the vhost span is tokenized. Timestamp,
+		// client (often an earlier [TG:IP:N] token — hence \S+) and the rest
+		// of the line survive untouched. Runs LAST in patternNames so the IP
+		// family and hostname_internal claim vhost values first: an IP-literal
+		// vhost is then attributed to ipv4/ipv4_private, and an
+		// already-tokenized vhost simply makes this pattern skip the line.
+		// IPv6 bracket vhosts (`[2001:db8::1]:443 …`) are out of scope.
+		{
+			Name: "accesslog_hostname",
+			Regex: regexp.MustCompile(`(?m)^([a-zA-Z][a-zA-Z0-9._-]*` +
+				`|\d[A-Za-z0-9]*\.[a-zA-Z0-9][a-zA-Z0-9._-]*` +
+				`|\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?` +
+				`[ 	]+\S+[ 	]+-[ 	]+-[ 	]+` +
+				`\[(?:\d{2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{2}:\d{2}:\d{2}[ 	]?[+-]\d{4}` +
+				`|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)\]`),
+			Category: "HOST",
+			Group:    1,
+			Enabled:  false,
+		},
 	}
 	return append(DefaultPatterns(), extra...)
 }
@@ -249,7 +275,7 @@ var patternNames = []string{
 	"api_key_slack", "api_key_gitlab", "bearer_token", "email", "ipv4_private",
 	"ipv4", "ipv6", "mac_address", "database_connection", "credit_card", "ssn_us",
 	"phone", "hostname_internal", "iban", "passport", "high_entropy_secret",
-	"syslog_hostname", "passwd_username",
+	"syslog_hostname", "passwd_username", "accesslog_hostname",
 }
 
 // AllPatterns returns every known pattern (defaults plus extended). Extended

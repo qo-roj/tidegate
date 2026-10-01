@@ -155,7 +155,9 @@ elif [[ "$DO_BUILD" == true ]]; then
         exit 1
     }
     STAGED="$(mktemp)"
-    (cd "$TMP_SRC" && go build -o "$STAGED" ./cmd/tidegate)
+    # CGO_ENABLED=0: static binary, runs on any distro regardless of the
+    # build host's glibc (Debian 11 etc.). modernc/sqlite is pure Go.
+    (cd "$TMP_SRC" && CGO_ENABLED=0 go build -o "$STAGED" ./cmd/tidegate)
     rm -rf "$TMP_SRC"
     install_binary "$STAGED"
     rm -f "$STAGED"

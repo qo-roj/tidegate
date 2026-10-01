@@ -85,7 +85,7 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 - **TLS listener** — optional `--cert`/`--key` for HTTPS on untrusted networks
 - **Docker support** — official `docker compose` setup with Ollama sidecar
 - **CI/CD** — GitHub Actions with automated testing and cross-platform release binaries
-- **Single binary** — Go, no runtime dependencies, cross-platform
+- **Single binary** — Go, no runtime dependencies, cross-platform. Linux builds are fully static (`CGO_ENABLED=0`, pure-Go SQLite): one binary runs on any distro — Debian 11, RHEL 8, Alpine — with no glibc version requirements.
 
 ## Documentation
 

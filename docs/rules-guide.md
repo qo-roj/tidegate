@@ -122,6 +122,7 @@ Built-in patterns:
 | `high_entropy_secret` | 36+ char alphanumeric strings (opt-in: training-data preset; matches UUIDs too — deliberate fail-safe) | `zZ9Y8X7W6V5U4T3S2R1Q0P9O8N7M6L5K4J3I2H1` | `[TG:SECRET:1]` |
 | `syslog_hostname` | Hostnames in syslog-style timestamped lines with process tag (structure-anchored: timestamp and process stay, hostname tokenized) | `Sep  3 17:54:01 web01 sshd[1]: …` | `Sep  3 17:54:01 [TG:HOST:1] sshd[1]: …` |
 | `passwd_username` | Account names in passwd/shadow-style lines (structure-anchored: field layout stays, name tokenized) | `alice:x:1000:1000:…` | `[TG:USER:1]:x:1000:1000:…` |
+| `accesslog_hostname` | Virtual host in Apache/nginx combined access logs (structure-anchored: `vhost[:port] client - - [timestamp]`; port, client and timestamp stay, vhost tokenized). Default-on since v0.6.2 — found live: vhost leaked while client IP was redacted | `myhost.com:443 1.2.3.4 - - [01/Oct/2026:14:44:22 +0200] …` | `[TG:HOST:1]:443 1.2.3.4 - - [01/Oct/2026:14:44:22 +0200] …` |
 
 Pattern toggles live in `[redaction.patterns]` (e.g. `syslog_hostname = false`); defaults are set in `rules/defaults.conf`. Extended patterns (private IPs, internal hostnames, IBAN, passport, high-entropy secrets) are opt-in per preset.
 

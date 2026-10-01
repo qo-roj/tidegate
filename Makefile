@@ -7,6 +7,11 @@ PLATFORMS=linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 all: build
 
+# Static build: no glibc version requirement, runs on any distro (the
+# Dockerfile already builds this way). modernc/sqlite is pure Go.
+CGO_ENABLED ?= 0
+export CGO_ENABLED
+
 build:
 	go build $(LDFLAGS) -o bin/$(BINARY) ./cmd/tidegate
 

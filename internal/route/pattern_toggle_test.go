@@ -106,3 +106,31 @@ passwd_username = true
 		t.Errorf("passwd_username toggle inactive: %q", out)
 	}
 }
+
+// accesslog_hostname must activate through the config toggle path — the
+// 2026-10-01 Earl report: vhost myhost.com survived while the client IP was
+// tokenized, because no pattern covered the access-log vhost shape.
+func TestAccesslogHostnameActivatesViaToggle(t *testing.T) {
+	cfg, err := rules.ParseConfigBytes([]byte(`
+[redaction.patterns]
+accesslog_hostname = true
+`), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := rules.BuildRuleSet(cfg, "user")
+	r := New(rs, nil, nil)
+	red := r.newRedactor()
+
+	in := `myhost.com:443 203.0.113.7 - - [01/Oct/2026:14:44:22 +0200] "GET / HTTP/1.1" 404 512 "-" "curl"` + "\n"
+	// Unmentioned code-default patterns stay enabled, so the client IP is
+	// tokenized by ipv4 (which runs earlier). Both tokens in one line is
+	// exactly the fixed behavior.
+	out, _ := red.Redact(in)
+	if !strings.HasPrefix(out, "[TG:HOST:1]:443 [TG:IP:1] - - [01/Oct/2026:14:44:22 +0200]") {
+		t.Errorf("accesslog_hostname toggle inactive: %q", out)
+	}
+	if strings.Contains(out, "myhost.com") {
+		t.Errorf("vhost survived: %q", out)
+	}
+}

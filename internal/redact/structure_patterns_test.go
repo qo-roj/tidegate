@@ -59,6 +59,123 @@ func TestSyslogHostnameDedup(t *testing.T) {
 	}
 }
 
+// Access-log vhost pattern: Apache/nginx combined logs with a leading
+// virtual host (`vhost[:port] client - - [dd/Mon/yyyy:…]`) must tokenize
+// only the vhost. Found live by Earl: myhost.com survived redaction while
+// the client IP was tokenized (2026-10-01).
+func TestAccesslogHostnameRedacts(t *testing.T) {
+	r := newTestRedactor("accesslog_hostname")
+	in := `myhost.com:443 203.0.113.7 - - [01/Oct/2026:14:44:22 +0200] "GET /en/?id=147&view=category HTTP/1.1" 404 32445 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0"` + "\n"
+	out, s := r.Redact(in)
+	if !strings.HasPrefix(out, "[TG:HOST:1]:443 203.0.113.7 - - [01/Oct/2026:14:44:22 +0200]") {
+		t.Errorf("vhost not redacted with structure intact: %q", out)
+	}
+	if strings.Contains(out, "myhost.com") {
+		t.Errorf("hostname survived redaction: %q", out)
+	}
+	if s["accesslog_hostname"] != 1 {
+		t.Errorf("summary = %v, want accesslog_hostname: 1", s)
+	}
+}
+
+// The exact form Earl pasted: client already tokenized by the IP pattern,
+// vhost still plaintext. The pattern must survive [TG:IP:N] in the client
+// field and not re-tokenize the IP token.
+func TestAccesslogHostnameAfterIPRedaction(t *testing.T) {
+	r := newTestRedactor("accesslog_hostname")
+	in := `myhost.com:443 [TG:IP:1] - - [01/Oct/2026:14:44:22 +0200] "GET / HTTP/1.1" 404 32445 "-" "Mozilla/5.0"` + "\n"
+	out, _ := r.Redact(in)
+	if !strings.HasPrefix(out, "[TG:HOST:1]:443 [TG:IP:1] - - [01/Oct/2026:14:44:22 +0200]") {
+		t.Errorf("unexpected output: %q", out)
+	}
+	restored := r.Restore(out)
+	if restored != in {
+		t.Errorf("restore round-trip failed:\n got %q\nwant %q", restored, in)
+	}
+}
+
+func TestAccesslogHostnameVariants(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no port", "api.example.org 192.168.1.5 - - [30/Sep/2026:23:59:59 +0000] \"POST /login HTTP/2.0\" 401 87 \"-\" \"-\"",
+			"[TG:HOST:1] 192.168.1.5 - - [30/Sep/2026:23:59:59 +0000]"},
+		{"rfc3339", "cdn.mycorp.internal:8443 [TG:IP:2] - - [2026-09-30T23:59:59Z] \"GET / HTTP/1.1\" 200 10 \"-\" \"-\"",
+			"[TG:HOST:1]:8443 [TG:IP:2] - - [2026-09-30T23:59:59Z]"},
+		{"dash client", "shop.example.net:443 - - - [01/Oct/2026:00:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"",
+			"[TG:HOST:1]:443 - - - [01/Oct/2026:00:00:00 +0000]"},
+		{"ip vhost", "10.0.0.5:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"",
+			"[TG:HOST:1]:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200]"},
+	}
+	for _, tc := range cases {
+		// Fresh redactor per case: counters accumulate across Redact calls
+		// on a shared Redactor, so token numbers would drift.
+		r := newTestRedactor("accesslog_hostname")
+		out, _ := r.Redact(tc.in + "\n")
+		if !strings.HasPrefix(out, tc.want) {
+			t.Errorf("%s: got %q, want prefix %q", tc.name, out, tc.want)
+		}
+	}
+}
+
+// Prose must pass through untouched: the pattern is structure-anchored, so
+// a hostname in prose, a normal combined log without vhost, dated prose and
+// mid-line occurrences all stay readable.
+func TestAccesslogHostnameProseSafety(t *testing.T) {
+	r := newTestRedactor("accesslog_hostname")
+	cases := []string{
+		"You can run it on myhost.com:443 - see our docs for details.",
+		"203.0.113.7 - - [01/Oct/2026:14:44:22 +0200] \"GET / HTTP/1.1\" 200 512 \"-\" \"curl\" (no vhost)",
+		"Check https://myhost.com:443 - - [careful] mid-line",
+		"myhost.com is where the dash dash - - shape appears in prose [01/Oct/2026:14:44:22 +0200] but not at line start with a client field.",
+		"2026-09-30 somehost - - [2026-09-30T10:00:00Z] dated prose lookalike",
+	}
+	for _, in := range cases {
+		out, s := r.Redact(in + "\n")
+		if out != in+"\n" {
+			t.Errorf("prose modified: %q -> %q", in, out)
+		}
+		if len(s) != 0 {
+			t.Errorf("prose produced redactions %v for %q", s, in)
+		}
+	}
+}
+
+// Same vhost across lines dedupes to one token; a second vhost gets its own.
+func TestAccesslogHostnameDedup(t *testing.T) {
+	r := newTestRedactor("accesslog_hostname")
+	out, s := r.Redact("a.example.com:443 1.2.3.4 - - [01/Oct/2026:10:00:00 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n" +
+		"a.example.com:443 1.2.3.4 - - [01/Oct/2026:10:00:01 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n" +
+		"b.example.com:443 1.2.3.4 - - [01/Oct/2026:10:00:02 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n")
+	if got := strings.Count(out, "[TG:HOST:1]"); got != 2 {
+		t.Errorf("same vhost should reuse token, got %d HOST:1 in %q", got, out)
+	}
+	if strings.Count(out, "[TG:HOST:2]") != 1 {
+		t.Errorf("second vhost should get HOST:2, got %q", out)
+	}
+	if s["accesslog_hostname"] != 3 {
+		t.Errorf("summary = %v, want 3", s)
+	}
+}
+
+// Ordering: with ipv4 also enabled, an IP-literal vhost is attributed to the
+// IP pattern (which runs earlier and consumes the span), not to this pattern.
+func TestAccesslogHostnameIPVhostAttribution(t *testing.T) {
+	r := newTestRedactor("ipv4", "accesslog_hostname")
+	out, s := r.Redact("10.0.0.5:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n")
+	if !strings.Contains(out, "[TG:IP:1]:443 [TG:IP:2] - - ") {
+		t.Errorf("IP vhost not attributed to IP pattern: %q", out)
+	}
+	if strings.Contains(out, "[TG:HOST:") {
+		t.Errorf("vhost pattern stole an IP-literal vhost: %q", out)
+	}
+	if s["accesslog_hostname"] != 0 {
+		t.Errorf("summary = %v, want no accesslog_hostname", s)
+	}
+}
+
 func TestSyslogHostnameIgnoresMidLineTimestamps(t *testing.T) {
 	r := newTestRedactor("syslog_hostname")
 	out, s := r.Redact("The meeting notes say 17:54:01 himbeerkuchen and nothing else.")
