@@ -142,11 +142,26 @@ making bypass harder. This is a future feature.
 - **Agent**: Untrusted. It reads your files and wants to send everything to the
   cloud. Tidegate intercepts and sanitizes.
 - **Tidegate**: Trusted. Runs locally, user-configured, open source, auditable.
-  The only component that sees both redacted and original data.
+  The only component that sees both redacted and original data. Its session
+  vault (`vault.db`) holds plaintext originals at rest for token continuity —
+  mode `0600`, directory `0700`, 24h TTL, local only.
 - **Cloud API**: Semi-trusted. We send it scrubbed data. We trust it to process
   our request but we minimize what we reveal.
 - **Local Ollama**: Trusted. Runs locally, offline. Sees raw sensitive data but
   never sends it anywhere.
+
+## Data at Rest
+
+The session vault is the one place Tidegate writes originals to disk. It exists
+so a token can still mean the same thing five turns later.
+
+- `~/.local/share/tidegate/vault.db`, mode `0600`, parent directory `0700`
+- Entries expire after `vault_ttl_hours` (default 24) and are swept every
+  10 minutes; expired tokens no longer resolve
+- Deleting the file is safe: the next request re-redacts and re-tokenises
+- Anyone who can read the file can read the redacted values. It is not
+  encrypted at rest — use full-disk encryption if that matters to you
+- Do not include it in third-party backups
 
 ## Scope
 

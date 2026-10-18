@@ -25,7 +25,7 @@ machine.
 curl -fsSL https://raw.githubusercontent.com/qo-roj/tidegate/main/scripts/install.sh | bash
 tidegate setup-ollama     # configure local model
 tidegate start             # start gateway
-tidegate install --all     # configure your agents
+tidegate wrap claude       # point an agent at the gateway (or: install --all)
 ```
 
 The script installs to `/usr/local/bin` when possible (writable, or
@@ -45,7 +45,7 @@ make build
 make install                # /usr/local/bin if writable, else ~/.local/bin
 tidegate setup-ollama
 tidegate start
-tidegate install --all
+tidegate wrap claude
 ```
 
 ### Option C — Docker
@@ -65,13 +65,17 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 
 1. **Intercept** — agents route through Tidegate instead of hitting cloud APIs directly
 2. **Classify** — content is tiered: public / redacted / local-only / blocked
-3. **Redact** — IPs, emails, API keys, private keys, PII are replaced with tokens
+3. **Redact** — IPs, emails, API keys, private keys, PII are replaced with tokens; JSON secrets are caught by key, not just by pattern
 4. **Route** — sensitive content goes to local Ollama, scrubbed content goes to cloud
 5. **Audit** — every call logged with what was redacted, what went where
 
 ## Features
 
 - **Gateway mode** — run one Tidegate on a server/Raspberry Pi for the whole LAN (`--bind 0.0.0.0` + client keys); any-OS clients just point their base URL at it, no local install — see [Gateway Mode](docs/gateway-mode.md)
+- **Session-scoped token vault** — tokens stay stable across a conversation, so a value redacted in turn 1 is still `[TG:IP:1]` in turn 5 and always resolves to the same original; mappings are per-conversation, persisted locally, and expire (default 24h) — see [Sessions](docs/sessions.md)
+- **Content-aware redaction** — JSON bodies are scanned for sensitive keys (`password`, `api_key`, `authorization`, DSNs), catching secrets no regex recognises; log timestamps are shielded before pattern matching so phone/date patterns cannot eat them
+- **`tidegate wrap` / `unwrap`** — point Claude Code, Codex, or OpenCode at the gateway in one command, and undo it exactly — see [Wrap](docs/wrap.md)
+- **Metrics** — Prometheus `/metrics` + JSON `/stats` on `127.0.0.1:9116`: requests, tiers, redactions by pattern, blocks, fail-closed events, cache hits, vault size — see [Metrics](docs/metrics.md)
 - **Client authentication** — per-device pre-shared keys (`X-Tidegate-Key`, `tidegate keygen --add <name>`); key identity overrides the spoofable agent header; keys never reach cloud providers
 - **Pattern redaction** — IPv4/IPv6, emails, phone numbers, API keys (GitHub, OpenAI, AWS, Anthropic, Google, Stripe, Slack, GitLab), JWTs, private keys, MAC addresses, credit cards, SSNs, database connection strings
 - **`tidegate text`** — one-off redaction of text, files, or piped stdin for safe pasting into any web UI (ChatGPT, chatbots, tickets); `--out` writes a file, `--summary` lists what was caught
@@ -91,6 +95,9 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 
 - [Architecture](docs/architecture.md)
 - [Gateway Mode](docs/gateway-mode.md)
+- [Sessions & Token Vault](docs/sessions.md)
+- [Wrap & Unwrap](docs/wrap.md)
+- [Metrics](docs/metrics.md)
 - [Threat Model](docs/threat-model.md)
 - [Rules Guide](docs/rules-guide.md)
 - [Agent Setup](docs/agent-setup.md)

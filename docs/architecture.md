@@ -89,12 +89,13 @@ escalated to the **highest** tier present (conservative — when in doubt, escal
 ### 3. Redactor (`internal/redact/`)
 
 - Applies regex replacements based on enabled patterns
-- Maintains an in-memory `map[string]string` mapping redaction tokens back to originals
 - Token format: `[TG:IP:1]`, `[TG:EMAIL:3]`, `[TG:TOKEN:1]` — distinctive `TG:` prefix prevents collisions
 - Reverse-maps tokens in response content (including SSE streams) so the agent can act on real values
 - Fuzzy matching handles reformatted tokens (quotes stripped, brackets removed)
-- Mappings are **scoped per request** — never shared across requests, destroyed after completion
-- Never persists the mapping table — in-memory only
+- With a vault attached, mappings are **session-scoped and persistent**: the same value keeps the same token across turns, and each conversation numbers independently — see [Sessions](sessions.md)
+- Without a vault (stateless calls), behaviour is per-request and in-memory
+- Restore is scoped to tokens that appeared in the request or were allocated for it, so unrelated tokens stay opaque
+- The vault (not the redactor) owns persistence; it lives at `~/.local/share/tidegate/vault.db`, mode `0600`, with a TTL
 
 See [Design Decisions §3](design-decisions.md#issue-3-token-reverse-mapping-robustness) for
 token format and fuzzy matching details.
@@ -102,13 +103,16 @@ token format and fuzzy matching details.
 ```go
 type Redactor struct {
     patterns []*Pattern
-    scope    *RequestScope  // per-request mapping, not global
+    store    TokenStore   // optional session vault
+    session  string
+    seen     map[string]bool // tokens this request may resolve
     mu       sync.Mutex
 }
 
 func (r *Redactor) Redact(content string) string
 func (r *Redactor) Restore(content string) string
-func (r *Redactor) ProcessStreamChunk(chunk []byte) []byte  // SSE streaming support
+func (r *Redactor) NoteTokens(content string)       // history tokens become resolvable
+func (r *Redactor) Snapshot() map[string]string     // scoped token view
 ```
 
 ### 4. Router (`internal/route/`)
@@ -170,6 +174,36 @@ tidegate audit --export > log.json # export for compliance
 - Returns the de-identified summary for cloud forwarding
 - If Ollama is down, falls back to blocking `local-only` content
 
+### 7. Token Vault (`internal/vault/`)
+
+SQLite store for session-scoped tokens and the content-addressed redaction
+cache. Allocates tokens deterministically per `(session, category, value)`,
+sweeps expired entries every 10 minutes, and answers lineage queries
+("which session owns these tokens?"). See [Sessions](sessions.md).
+
+### 8. Content Shaper (`internal/content/`)
+
+Detects block shape (`json`, `log`, `code`, `diff`, `text`) and applies
+shape-specific transforms:
+
+- JSON: values under sensitive keys (`password`, `api_key`, `authorization`,
+  DSNs, cookies) are redacted wholesale — this catches secrets no regex
+  recognises, and never re-encodes the document.
+- Logs/prose/JSON: timestamp spans are replaced with inert sentinels before
+  pattern redaction and restored afterwards, so patterns cannot fire inside a
+  timestamp (the v0.6.3 phone false positive class).
+
+### 9. Wrap (`internal/wrap/`)
+
+Edits agent CLIs' own configuration to point at the gateway, records the prior
+values, and restores them on `unwrap`. Supported: Claude Code, Codex, OpenCode,
+plus a shell-export target. See [Wrap](wrap.md).
+
+### 10. Metrics (`internal/metrics/`)
+
+In-process counters exposed as Prometheus text and JSON on
+`127.0.0.1:9116` (`--metrics-addr`, `--no-metrics`). See [Metrics](metrics.md).
+
 ## Request Flow (Detailed)
 
 ```
@@ -227,16 +261,25 @@ tidegate audit --export > log.json # export for compliance
 
 - Redaction is regex-based — O(n) in content size per pattern
 - Typical agent request: 10-100KB → sub-millisecond redaction
+- Identical blocks in a session are served from the redaction cache (hash
+  lookup + SQLite read) instead of being re-scanned
+- Token allocation is one prepared statement per new value; lookups hit the
+  in-process map first
 - Ollama summarization adds latency for local-only content (1-5s)
 - Audit log is async (buffered write queue), non-blocking
 - Proxy adds <1ms overhead for pass-through (public content)
 
 ## Security Considerations
 
-- The mapping table (redaction token → original) lives in process memory only
-- Mappings are **scoped per request** — never shared across requests
-- Never written to disk, never logged, never sent anywhere
-- Cleared after each request completes
+- The mapping table (redaction token → original) lives in the session vault at
+  `~/.local/share/tidegate/vault.db` (mode `0600`, directory `0700`)
+- Mappings are **scoped per session**; each conversation numbers independently,
+  so one session's token cannot resolve another session's value
+- Mappings expire (default 24h) and are never logged or sent upstream
+- Reverse mapping only resolves tokens the current request actually carried;
+  invented or foreign tokens stay opaque
+- The vault holds plaintext originals at rest — treat it like shell history;
+  it is excluded from third-party backups by default
 - Process runs as user (not root), reads only files the user can read
 - The proxy itself is localhost-only — no remote access to the gateway
 - Bypass vectors (encoding, fragmentation, obfuscation) are addressed via layered

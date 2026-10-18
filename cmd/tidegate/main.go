@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,10 +16,12 @@ import (
 
 	"github.com/qo-roj/tidegate/internal/audit"
 	"github.com/qo-roj/tidegate/internal/config"
+	"github.com/qo-roj/tidegate/internal/metrics"
 	"github.com/qo-roj/tidegate/internal/ollama"
 	"github.com/qo-roj/tidegate/internal/proxy"
 	"github.com/qo-roj/tidegate/internal/route"
 	"github.com/qo-roj/tidegate/internal/rules"
+	"github.com/qo-roj/tidegate/internal/vault"
 )
 
 // Version is set at build time via -ldflags.
@@ -45,6 +48,10 @@ func main() {
 		cmdText(os.Args[2:])
 	case "keygen":
 		cmdKeygen(os.Args[2:])
+	case "wrap":
+		cmdWrap(os.Args[2:])
+	case "unwrap":
+		cmdUnwrap(os.Args[2:])
 	case "config":
 		cmdConfig(os.Args[2:])
 	case "install":
@@ -74,6 +81,8 @@ Commands:
   classify       Test how a file would be classified
   text           Redact text/file/stdin for safe pasting (clean output)
   keygen         Generate a gateway client key (gateway mode)
+  wrap           Point an agent CLI at Tidegate (claude, codex, opencode, env)
+  unwrap         Restore an agent's original configuration
   config         Edit or view configuration
   install        Configure an agent to use Tidegate
   setup-ollama   Configure local Ollama model
@@ -93,6 +102,9 @@ func cmdStart(args []string) {
 	keyfile := fs.String("keyfile", "", "Client keys file for gateway mode: lines of \"name key\" (comments with #). Enables gateway mode.")
 	requireKey := fs.Bool("require-key", false, "Refuse unauthenticated requests even if no client keys are configured (blocks all requests — for testing/lockdown)")
 	allowUnauth := fs.Bool("allow-unauth", false, "Serve on a non-loopback bind WITHOUT client keys (acknowledged risk: anyone on the network can use the gateway)")
+	metricsAddr := fs.String("metrics-addr", "", "Prometheus/JSON metrics listen address (default: 127.0.0.1:9116)")
+	noMetrics := fs.Bool("no-metrics", false, "Disable the metrics listener")
+	vaultTTL := fs.Int("vault-ttl-hours", 0, "Hours a redaction token stays resolvable (default: 24)")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*port, *preset)
@@ -110,6 +122,15 @@ func cmdStart(args []string) {
 	}
 	if *keyFile != "" {
 		cfg.Gateway.KeyFile = *keyFile
+	}
+	if *metricsAddr != "" {
+		cfg.Gateway.MetricsAddr = *metricsAddr
+	}
+	if *vaultTTL > 0 {
+		cfg.Gateway.VaultTTL = time.Duration(*vaultTTL) * time.Hour
+	}
+	if *noMetrics {
+		cfg.Gateway.MetricsAddr = ""
 	}
 	var extraClients []config.Client
 	if *keyfile != "" {
@@ -178,7 +199,7 @@ func cmdStart(args []string) {
 	// Initialize audit log
 	home, _ := os.UserHomeDir()
 	dataDir := filepath.Join(home, ".local", "share", "tidegate")
-	os.MkdirAll(dataDir, 0755)
+	os.MkdirAll(dataDir, 0700)
 	dbPath := filepath.Join(dataDir, "audit.db")
 	auditLog, err := audit.New(dbPath)
 	if err != nil {
@@ -195,8 +216,32 @@ func cmdStart(args []string) {
 		fmt.Printf("   Ollama: ✗ not available (local-only content will be blocked)\n")
 	}
 
+	// Session vault: stable tokens across turns + redaction cache.
+	vaultPath := filepath.Join(dataDir, "vault.db")
+	v, err := vault.Open(vaultPath, cfg.Gateway.VaultTTL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening token vault: %v\n", err)
+		os.Exit(1)
+	}
+	defer v.Close()
+	fmt.Printf("   Vault: %s (ttl %s)\n", vaultPath, cfg.Gateway.VaultTTL)
+
+	// Metrics registry + listener.
+	reg := metrics.New()
+	reg.SetVaultStats(v.Stats)
+	if cfg.Gateway.MetricsAddr != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/", reg.Handler())
+			if err := http.ListenAndServe(cfg.Gateway.MetricsAddr, mux); err != nil {
+				fmt.Fprintf(os.Stderr, "Metrics listener: %v\n", err)
+			}
+		}()
+		fmt.Printf("   Metrics: http://%s/metrics\n", cfg.Gateway.MetricsAddr)
+	}
+
 	// Initialize router
-	router := route.New(cfg.RuleSet, ollamaClient, auditLog)
+	router := route.New(cfg.RuleSet, ollamaClient, auditLog).WithVault(v)
 
 	// Initialize and start proxy
 	srv := proxy.New(router, auditLog, cfg.Gateway.Port)
@@ -204,6 +249,8 @@ func cmdStart(args []string) {
 	srv.CertFile = cfg.Gateway.CertFile
 	srv.KeyFile = cfg.Gateway.KeyFile
 	srv.RequireKey = *requireKey
+	srv.Vault = v
+	srv.Metrics = reg
 	for _, c := range cfg.Clients {
 		srv.Clients = append(srv.Clients, proxy.Client{Name: c.Name, Key: c.Key})
 	}

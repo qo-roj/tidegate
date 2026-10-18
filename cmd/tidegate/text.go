@@ -123,7 +123,7 @@ func splitTextArgs(positionals []string) (text []string, flagAfterText string) {
 // normalization (one trailing newline) happens in the output layer so that
 // --out files preserve the input's exact newline state.
 func runText(content string, r *redact.Redactor) (string, redact.Summary) {
-	return r.Redact(content)
+	return route.ApplyShapeRedaction(content, r)
 }
 
 // ensureTrailingNewline returns s with exactly one terminal newline, for

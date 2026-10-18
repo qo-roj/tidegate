@@ -29,15 +29,32 @@ type Pattern struct {
 	Group int
 }
 
-// Redactor holds active patterns and the token mapping for the current request.
-// The mapping is never persisted, never logged, and is cleared after each
-// request completes.
+// TokenStore is the persistence backend for session-scoped token mappings.
+// When configured, tokens survive across requests and are allocated
+// deterministically per session, so a token echoed back in conversation
+// history always resolves to the value it originally replaced.
+type TokenStore interface {
+	Token(session, category, original string) (string, error)
+	Tokens(session string) (map[string]string, error)
+}
+
+// Redactor holds active patterns and the token mapping for the current
+// request. With a TokenStore attached, mappings are session-scoped and
+// persistent; without one it behaves as before (per-request, in-memory).
 type Redactor struct {
 	patterns []*Pattern
 	mapping  map[string]string // token → original value
 	reverse  map[string]string // original value → token (for O(1) dedup)
 	mu       sync.Mutex
 	counters map[string]int64 // per-category counter for unique tokens
+
+	store   TokenStore
+	session string
+	// seen holds tokens observed in the incoming request (history) plus
+	// tokens allocated for it. Only these may be restored in a response:
+	// a model that invents or quotes an unrelated token cannot use the
+	// gateway as an oracle for values from another conversation.
+	seen map[string]bool
 }
 
 // New creates a Redactor with default patterns. Use WithPatterns to customize.
@@ -47,7 +64,52 @@ func New() *Redactor {
 		reverse:  make(map[string]string),
 		counters: make(map[string]int64),
 		patterns: DefaultPatterns(),
+		seen:     make(map[string]bool),
 	}
+}
+
+// WithStore attaches a persistent store and session. Returns the redactor for
+// chaining.
+func (r *Redactor) WithStore(store TokenStore, session string) *Redactor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.store = store
+	r.session = session
+	return r
+}
+
+// Session returns the session this redactor is scoped to.
+func (r *Redactor) Session() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.session
+}
+
+// tokenRe matches the canonical Tidegate token shape.
+var tokenRe = regexp.MustCompile(`\[TG:[A-Z0-9_]+:[0-9]+\]`)
+
+// NoteTokens records every Tidegate token present in content as "seen" for
+// this request. Call it for incoming conversation history so historical
+// tokens remain resolvable in the response, while unrelated tokens stay
+// opaque.
+func (r *Redactor) NoteTokens(content string) {
+	matches := tokenRe.FindAllString(content, -1)
+	if len(matches) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, m := range matches {
+		r.seen[m] = true
+	}
+}
+
+// Allocate returns a token for an arbitrary category/value pair. Used by
+// structure-aware redaction (e.g. sensitive JSON keys) which has no Pattern.
+func (r *Redactor) Allocate(category, original string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.allocateCategory(category, original)
 }
 
 // WithPatterns replaces the pattern set. Returns the redactor for chaining.
@@ -132,6 +194,10 @@ func (r *Redactor) Redact(content string) (string, Summary) {
 // Restore reverse-maps tokens in a response back to their original values.
 // This lets the agent work with real data in the cloud model's response.
 //
+// Only tokens seen in the request (or allocated for it) are restored. A model
+// that hallucinates a token, or quotes one from a different conversation,
+// cannot use the gateway to recover values it was never given.
+//
 // Mapping values may themselves contain tokens (e.g. a database_connection
 // match whose original embeds an EMAIL token redacted by an earlier
 // pattern). Values are expanded transitively before replacement so nested
@@ -141,15 +207,14 @@ func (r *Redactor) Restore(content string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(r.mapping) == 0 {
+	snapshot := r.snapshotLocked()
+	if len(snapshot) == 0 {
 		return content
 	}
 
-	// Expand nested tokens inside mapping values (bounded depth guards
-	// against accidental cycles).
-	expanded := make(map[string]string, len(r.mapping))
-	for token, original := range r.mapping {
-		expanded[token] = r.expandValue(original, 0)
+	expanded := make(map[string]string, len(snapshot))
+	for token, original := range snapshot {
+		expanded[token] = expandValue(original, snapshot, 0)
 	}
 
 	tokens := make([]string, 0, len(expanded))
@@ -170,26 +235,58 @@ func (r *Redactor) Restore(content string) string {
 	return result
 }
 
+// Snapshot returns the token→original view this request is allowed to use:
+// everything allocated for it plus historical tokens that appeared in the
+// incoming request.
+func (r *Redactor) Snapshot() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotLocked()
+}
+
+func (r *Redactor) snapshotLocked() map[string]string {
+	out := make(map[string]string, len(r.mapping))
+	for token, original := range r.mapping {
+		out[token] = original
+	}
+	if r.store != nil && r.session != "" {
+		if stored, err := r.store.Tokens(r.session); err == nil {
+			for token, original := range stored {
+				if !r.seen[token] {
+					continue
+				}
+				if _, ok := out[token]; !ok {
+					out[token] = original
+				}
+			}
+		}
+	}
+	return out
+}
+
 // expandValue resolves redaction tokens embedded in a mapping value.
-func (r *Redactor) expandValue(value string, depth int) string {
+func expandValue(value string, snapshot map[string]string, depth int) string {
 	if depth > 10 {
 		return value
 	}
-	for token, original := range r.mapping {
+	for token, original := range snapshot {
 		if strings.Contains(value, token) {
-			value = strings.ReplaceAll(value, token, r.expandValue(original, depth+1))
+			value = strings.ReplaceAll(value, token, expandValue(original, snapshot, depth+1))
 		}
 	}
 	return value
 }
 
-// Clear wipes the mapping table. Call after a request completes.
+// Clear wipes the in-memory mapping table and seen set. Persistent store
+// entries are untouched — call after a request completes only when the
+// redactor is not session-scoped.
 func (r *Redactor) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.mapping = make(map[string]string)
 	r.reverse = make(map[string]string)
 	r.counters = make(map[string]int64)
+	r.seen = make(map[string]bool)
 }
 
 // MappingCount returns how many redactions are stored (for audit logging).
@@ -201,22 +298,49 @@ func (r *Redactor) MappingCount() int {
 
 // allocateToken creates a unique token for a matched value and stores the mapping.
 // Token format: [TG:CATEGORY:N] — e.g. [TG:IP:1], [TG:EMAIL:2]
-// Uses a reverse map for O(1) dedup instead of O(n) linear scan.
+// Uses a reverse map for O(1) dedup instead of O(n) linear scan. With a
+// store attached the token is stable for the lifetime of the session.
 func (r *Redactor) allocateToken(p *Pattern, original string) string {
-	// O(1) dedup check via reverse map
+	return r.allocateCategory(p.Category, original)
+}
+
+func (r *Redactor) allocateCategory(category, original string) string {
+	// O(1) dedup check: same value → same token, even across patterns.
 	if token, ok := r.reverse[original]; ok {
+		r.seen[token] = true
 		return token
 	}
 
-	category := p.Category
 	if category == "" {
 		category = "REDACTED"
 	}
-	n := r.counters[category] + 1
-	r.counters[category] = n
-	token := fmt.Sprintf("[TG:%s:%d]", category, n)
+
+	// Session-scoped store first: the store owns the numbering, so a value
+	// seen in an earlier turn gets the token it already had.
+	var token string
+	if r.store != nil && r.session != "" {
+		if t, err := r.store.Token(r.session, category, original); err == nil {
+			token = t
+		}
+		// On error fall through to in-memory allocation: losing continuity
+		// is preferable to losing redaction.
+	}
+
+	if token == "" {
+		for {
+			n := r.counters[category] + 1
+			r.counters[category] = n
+			candidate := fmt.Sprintf("[TG:%s:%d]", category, n)
+			if _, exists := r.mapping[candidate]; !exists {
+				token = candidate
+				break
+			}
+		}
+	}
+
 	r.mapping[token] = original
 	r.reverse[original] = token
+	r.seen[token] = true
 	return token
 }
 

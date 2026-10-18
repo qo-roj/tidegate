@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/qo-roj/tidegate/internal/rules"
 )
@@ -43,6 +44,11 @@ type Gateway struct {
 	// TLS certificate and key (pem). Empty = plain HTTP.
 	CertFile string
 	KeyFile  string
+	// VaultTTL is how long a redaction token stays resolvable.
+	VaultTTL time.Duration
+	// MetricsAddr is the listen address for /metrics and /stats.
+	// Empty disables the metrics listener.
+	MetricsAddr string
 }
 
 // Client is one authorized gateway client (pre-shared key).
@@ -83,10 +89,12 @@ type AppConfig struct {
 func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	cfg := &AppConfig{
 		Gateway: Gateway{
-			Port:     8842,
-			Bind:     "127.0.0.1",
-			LogLevel: "info",
-			Preset:   "desktop",
+			Port:        8842,
+			Bind:        "127.0.0.1",
+			LogLevel:    "info",
+			Preset:      "desktop",
+			VaultTTL:    24 * time.Hour,
+			MetricsAddr: "127.0.0.1:9116",
 		},
 		Local: Local{
 			OllamaURL:   "http://localhost:11434",
@@ -270,6 +278,12 @@ func applyGatewayFile(cfg *AppConfig, path string) {
 				cfg.Gateway.CertFile = v
 			case "key", "key_file", "tls_key":
 				cfg.Gateway.KeyFile = v
+			case "vault_ttl_hours":
+				if h, err := strconv.Atoi(v); err == nil && h > 0 && h <= 8760 {
+					cfg.Gateway.VaultTTL = time.Duration(h) * time.Hour
+				}
+			case "metrics_addr":
+				cfg.Gateway.MetricsAddr = v
 			}
 		case "local":
 			switch k {

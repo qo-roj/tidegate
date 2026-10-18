@@ -204,20 +204,26 @@ func extractPaths(content string) []string {
 // ParseRequest parses an LLM API request body and extracts content blocks.
 // Supports both OpenAI and Anthropic message formats.
 func ParseRequest(body []byte) []ContentBlock {
-	var blocks []ContentBlock
+	_, blocks, _ := ParseRequestAligned(body)
+	return blocks
+}
 
-	// Try to parse as a generic JSON object
+// ParseRequestAligned parses a request into message objects and one content
+// block per message, index-aligned. Messages that are not JSON objects are
+// omitted from both slices, so blocks[i] always describes messages[i].
+func ParseRequestAligned(body []byte) ([]map[string]interface{}, []ContentBlock, bool) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return blocks
+		return nil, nil, false
 	}
 
-	// Extract messages array
 	messages, ok := raw["messages"].([]interface{})
 	if !ok {
-		return blocks
+		return nil, nil, false
 	}
 
+	msgs := make([]map[string]interface{}, 0, len(messages))
+	blocks := make([]ContentBlock, 0, len(messages))
 	for _, msg := range messages {
 		m, ok := msg.(map[string]interface{})
 		if !ok {
@@ -248,10 +254,11 @@ func ParseRequest(body []byte) []ContentBlock {
 		// Try to extract command from content
 		block.Command = extractCommandFromContent(content)
 
+		msgs = append(msgs, m)
 		blocks = append(blocks, block)
 	}
 
-	return blocks
+	return msgs, blocks, true
 }
 
 // extractContent gets the text content from a message, handling both

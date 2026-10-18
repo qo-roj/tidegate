@@ -4,14 +4,20 @@
 package route
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/qo-roj/tidegate/internal/audit"
 	"github.com/qo-roj/tidegate/internal/classify"
+	"github.com/qo-roj/tidegate/internal/content"
 	"github.com/qo-roj/tidegate/internal/ollama"
 	"github.com/qo-roj/tidegate/internal/redact"
 	"github.com/qo-roj/tidegate/internal/rules"
+	"github.com/qo-roj/tidegate/internal/vault"
 )
 
 // RequestContext holds per-request state (primarily the redactor mapping)
@@ -20,6 +26,16 @@ import (
 // from cross-contaminating each other's token mappings.
 type RequestContext struct {
 	Redactor *redact.Redactor
+	// Session is the conversation identity used for the token vault.
+	Session string
+	// Summary counts redactions by pattern (plus json_secret for
+	// structure-aware redaction).
+	Summary redact.Summary
+	// Tiers counts classified blocks by tier.
+	Tiers map[string]int
+	// CacheHits counts blocks served from the content-addressed
+	// redaction cache instead of being re-scanned.
+	CacheHits int
 }
 
 // Router coordinates the classification, redaction, and routing of content.
@@ -29,9 +45,17 @@ type Router struct {
 	AuditLog   *audit.Log
 	RuleSet    *rules.RuleSet // kept for pattern-toggle consultation
 
+	// Vault, when set, makes token mappings session-scoped and persistent
+	// and enables delta-only processing.
+	Vault *vault.Vault
+
 	// enabledPatterns is the resolved [redaction.patterns] set (nil → all
 	// default patterns, matching pre-toggle behavior).
 	enabledPatterns []string
+
+	// rulesetFingerprint identifies the active pattern set in the
+	// redaction cache, so a config change never reuses stale output.
+	rulesetFingerprint string
 }
 
 // New creates a Router with all dependencies wired.
@@ -57,6 +81,22 @@ func New(rs *rules.RuleSet, ollamaClient *ollama.Client, auditLog *audit.Log) *R
 			}
 		}
 	}
+	r.rulesetFingerprint = ruleFingerprint(r.enabledPatterns)
+	return r
+}
+
+// ruleFingerprint hashes the active rule set. Bump redactionAlgoVersion when
+// the redaction algorithm changes in a way that alters output.
+func ruleFingerprint(patterns []string) string {
+	names := append([]string{}, patterns...)
+	sort.Strings(names)
+	sum := sha256.Sum256([]byte("redaction-v2\x00" + strings.Join(names, ",")))
+	return hex.EncodeToString(sum[:8])
+}
+
+// WithVault attaches a session vault. Returns the router for chaining.
+func (r *Router) WithVault(v *vault.Vault) *Router {
+	r.Vault = v
 	return r
 }
 
@@ -79,53 +119,80 @@ func (r *Router) NewRedactor() *redact.Redactor {
 // to the cloud API. For local-only blocks, the content is sent to Ollama
 // and replaced with a de-identified summary.
 //
-// Returns:
-//   - ctx: per-request RequestContext holding the redactor mapping for response restoration
-//   - modifiedBody: the request body with redactions/summaries applied
-//   - blocked: true if any block was blocked (caller should return error)
-//   - error: for unexpected failures
+// This is the stateless entry point. Callers that can identify a conversation
+// should use ProcessRequestSession so tokens stay stable across turns.
 func (r *Router) ProcessRequest(body []byte, agent string, provider string) (ctx *RequestContext, modifiedBody []byte, blocked bool, err error) {
-	// Parse the request into content blocks
-	blocks := classify.ParseRequest(body)
-	if len(blocks) == 0 {
-		// Can't parse — let it through as-is (better than blocking)
-		return &RequestContext{Redactor: redact.New()}, body, false, nil
-	}
+	return r.ProcessRequestSession(body, agent, provider, "")
+}
 
+// ProcessRequestSession is ProcessRequest with an explicit conversation
+// session. With a vault attached, only messages added since the last request
+// in the same session are classified and redacted; earlier messages are
+// forwarded byte-for-byte, which keeps provider prompt caches warm and avoids
+// re-tokenising history.
+func (r *Router) ProcessRequestSession(body []byte, agent string, provider, session string) (ctx *RequestContext, modifiedBody []byte, blocked bool, err error) {
 	// Parse as generic JSON for modification
 	var request map[string]interface{}
 	if err := json.Unmarshal(body, &request); err != nil {
-		return &RequestContext{Redactor: redact.New()}, body, false, nil // unparseable — pass through
+		return &RequestContext{Redactor: r.newRedactor(), Summary: redact.Summary{}}, body, false, nil // unparseable — pass through
 	}
 
-	messages, ok := request["messages"].([]interface{})
+	rawMessages, ok := request["messages"].([]interface{})
 	if !ok {
-		return &RequestContext{Redactor: redact.New()}, body, false, nil
+		return &RequestContext{Redactor: r.newRedactor(), Summary: redact.Summary{}}, body, false, nil
 	}
 
-	// Per-request Redactor — prevents concurrent cross-contamination.
-	// Built with the router's pattern-toggle set so [redaction.patterns]
-	// in any config layer actually takes effect.
-	reqRedactor := r.newRedactor()
-	ctx = &RequestContext{Redactor: reqRedactor}
+	blocks := classify.ParseRequest(body)
+	if len(blocks) == 0 {
+		// Can't parse — let it through as-is (better than blocking)
+		return &RequestContext{Redactor: r.newRedactor(), Summary: redact.Summary{}}, body, false, nil
+	}
 
-	var redactionSummary redact.Summary = make(redact.Summary)
-	anyBlocked := false
-
-	blockIdx := 0
-	for _, msg := range messages {
-		m, ok := msg.(map[string]interface{})
+	// Align message objects with content blocks. Both walks skip non-object
+	// messages, so the i-th pair is always the i-th message.
+	pairs := make([]messagePair, 0, len(rawMessages))
+	bi := 0
+	for _, raw := range rawMessages {
+		m, ok := raw.(map[string]interface{})
 		if !ok {
 			continue
 		}
-
-		if blockIdx >= len(blocks) {
+		if bi >= len(blocks) {
 			break
 		}
+		pairs = append(pairs, messagePair{msg: m, block: blocks[bi]})
+		bi++
+	}
+	if len(pairs) == 0 {
+		return &RequestContext{Redactor: r.newRedactor(), Summary: redact.Summary{}}, body, false, nil
+	}
 
-		block := blocks[blockIdx]
-		blockIdx++
+	// Session-scoped Redactor — keeps concurrency isolation and, when a
+	// vault is configured, stable tokens across turns.
+	reqRedactor := r.newRedactor()
+	if r.Vault != nil && session != "" {
+		reqRedactor.WithStore(r.Vault, session)
+	}
+	ctx = &RequestContext{
+		Redactor: reqRedactor,
+		Session:  session,
+		Summary:  redact.Summary{},
+		Tiers:    map[string]int{},
+	}
+
+	// Record tokens present anywhere in the incoming request (history
+	// included) so the response can resolve them — and only them.
+	for _, p := range pairs {
+		reqRedactor.NoteTokens(p.block.Content)
+	}
+
+	anyBlocked := false
+
+	for _, p := range pairs {
+		block := p.block
+		m := p.msg
 		result := r.Classifier.ClassifyBlock(block, agent)
+		ctx.Tiers[result.Tier.String()]++
 
 		switch result.Tier {
 		case rules.TierBlocked:
@@ -189,12 +256,13 @@ func (r *Router) ProcessRequest(body []byte, agent string, provider string) (ctx
 			}
 
 		case rules.TierRedacted:
-			// Apply pattern redaction to content
+			// Content-shape-aware redaction: JSON sensitive keys first,
+			// then patterns over timestamp-shielded text.
 			content := getBlockContent(m)
-			redacted, summary := reqRedactor.Redact(content)
+			redacted, summary := r.redactContent(ctx, reqRedactor, content)
 			setMessageContent(m, redacted)
 			for k, v := range summary {
-				redactionSummary[k] += v
+				ctx.Summary[k] += v
 			}
 			if r.AuditLog != nil {
 				redactionsJSON, _ := json.Marshal(summary)
@@ -230,6 +298,67 @@ func (r *Router) ProcessRequest(body []byte, agent string, provider string) (ctx
 	}
 
 	return ctx, modified, anyBlocked, nil
+}
+
+// ApplyShapeRedaction applies Tidegate's shape-aware redaction to one block:
+// JSON sensitive keys first, then patterns over timestamp-shielded text.
+// Exported so one-off surfaces (tidegate text) share the proxy's behaviour.
+func ApplyShapeRedaction(src string, reqRedactor *redact.Redactor) (string, redact.Summary) {
+	summary := redact.Summary{}
+
+	shielded, restore := content.ShieldTimestamps(src)
+
+	if content.Detect(src) == content.KindJSON {
+		var n int
+		shielded, n = content.RedactJSONKeys(shielded, func(key, value string) string {
+			return reqRedactor.Allocate("SECRET", value)
+		})
+		if n > 0 {
+			summary["json_secret"] = n
+		}
+	}
+
+	redacted, patternSummary := reqRedactor.Redact(shielded)
+	for k, v := range patternSummary {
+		summary[k] += v
+	}
+	return restore(redacted), summary
+}
+
+// redactContent applies shape-aware redaction with the content-addressed
+// cache in front of it.
+func (r *Router) redactContent(ctx *RequestContext, reqRedactor *redact.Redactor, src string) (string, redact.Summary) {
+	var cacheKey string
+	if r.Vault != nil && ctx.Session != "" {
+		sum := sha256.Sum256([]byte(src))
+		cacheKey = hex.EncodeToString(sum[:])
+		if redacted, sumJSON, ok, err := r.Vault.CachedRedaction(ctx.Session, r.rulesetFingerprint, cacheKey); err == nil && ok {
+			summary := redact.Summary{}
+			if err := json.Unmarshal([]byte(sumJSON), &summary); err == nil {
+				// The cached output still carries tokens from this
+				// session; mark them seen so responses can resolve them.
+				reqRedactor.NoteTokens(redacted)
+				ctx.CacheHits++
+				return redacted, summary
+			}
+		}
+	}
+
+	out, summary := ApplyShapeRedaction(src, reqRedactor)
+
+	if r.Vault != nil && ctx.Session != "" && cacheKey != "" {
+		if sumJSON, err := json.Marshal(summary); err == nil {
+			_ = r.Vault.StoreRedaction(ctx.Session, r.rulesetFingerprint, cacheKey, out, string(sumJSON))
+		}
+	}
+	return out, summary
+}
+
+// messagePair keeps a request message aligned with its extracted content
+// block.
+type messagePair struct {
+	msg   map[string]interface{}
+	block classify.ContentBlock
 }
 
 // ProcessResponse reverse-maps redaction tokens in the cloud model's response.

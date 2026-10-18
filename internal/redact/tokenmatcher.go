@@ -27,21 +27,26 @@ type fuzzyPattern struct {
 	captureGroup int
 }
 
-// tokenRegex matches the canonical [TG:CATEGORY:N] format.
-var tokenRegex = regexp.MustCompile(`\[TG:([A-Z]+):(\d+)\]`)
+// tokenRegex matches the canonical [TG:CATEGORY:N] format. Categories may
+// contain digits and underscores (e.g. JSON_SECRET).
+var tokenRegex = regexp.MustCompile(`\[TG:([A-Z0-9_]+):(\d+)\]`)
 
 // NewTokenMatcher creates a TokenMatcher from a redactor's current mapping.
+// Only tokens this request is allowed to resolve are included (see
+// Redactor.Snapshot).
 func NewTokenMatcher(r *Redactor) *TokenMatcher {
-	tm := &TokenMatcher{
-		mappings: make(map[string]string),
-	}
+	return NewTokenMatcherFromMap(r.Snapshot())
+}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// NewTokenMatcherFromMap builds a matcher from an explicit token→original map.
+func NewTokenMatcherFromMap(mappings map[string]string) *TokenMatcher {
+	tm := &TokenMatcher{
+		mappings: make(map[string]string, len(mappings)),
+	}
 
 	// Copy mappings and build fuzzy patterns for each category
 	categories := make(map[string]bool)
-	for token, original := range r.mapping {
+	for token, original := range mappings {
 		tm.mappings[token] = original
 
 		// Extract category from token
@@ -51,11 +56,12 @@ func NewTokenMatcher(r *Redactor) *TokenMatcher {
 		}
 	}
 
-	// Build fuzzy patterns for each category present in the mapping
+	// Build fuzzy patterns for each category present in the mapping.
+	// Quote/backtick wrappers are optional; underscores may replace colons.
 	for cat := range categories {
+		pattern := `["'\x60]?TG[:_]` + regexp.QuoteMeta(cat) + `[:_](\d+)["'\x60]?`
 		tm.fuzzy = append(tm.fuzzy, fuzzyPattern{
-			// Match: "TG:CAT:N", `TG:CAT:N`, TG:CAT:N, TG_CAT_N
-			regex:        regexp.MustCompile(`["'` + "`" + `]?TG[:_]` + cat + `[:_](\d+)["'` + "`" + `]?`),
+			regex:        regexp.MustCompile(pattern),
 			category:     cat,
 			captureGroup: 1,
 		})

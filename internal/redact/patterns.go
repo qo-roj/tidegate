@@ -372,6 +372,7 @@ func NewWithNames(enabled []string) *Redactor {
 		mapping:  make(map[string]string),
 		reverse:  make(map[string]string),
 		counters: make(map[string]int64),
+		seen:     make(map[string]bool),
 		patterns: patterns,
 	}
 }

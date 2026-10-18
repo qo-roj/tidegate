@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"github.com/qo-roj/tidegate/internal/audit"
+	"github.com/qo-roj/tidegate/internal/metrics"
 	"github.com/qo-roj/tidegate/internal/route"
+	"github.com/qo-roj/tidegate/internal/vault"
 )
 
 // UpstreamRoutes maps path prefixes to upstream API hosts.
@@ -83,6 +85,10 @@ type Server struct {
 	// TLS certificate and key paths. Both set = HTTPS listener.
 	CertFile string
 	KeyFile  string
+	// Vault, when set, gives requests a persistent session identity.
+	Vault *vault.Vault
+	// Metrics, when set, records request/redaction counters.
+	Metrics *metrics.Registry
 }
 
 // Client is one authorized gateway client (pre-shared key).
@@ -103,6 +109,11 @@ func New(router *route.Router, auditLog *audit.Log, port int) *Server {
 // GatewayClient is the header constant carrying a gateway client's
 // pre-shared key. The header is stripped before forwarding upstream.
 const GatewayClientHeader = "X-Tidegate-Key"
+
+// SessionHeader lets a client name its conversation explicitly. When absent,
+// Tidegate infers the session from tokens in the request or from the
+// conversation's opening messages.
+const SessionHeader = "X-Tidegate-Session"
 
 // clientByKey resolves a pre-shared key to its client. The loop compares
 // against EVERY configured key — no early return — so the number of
@@ -207,12 +218,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if agent == "" {
 		agent = detectAgent(r)
 	}
-
 	// Determine the upstream provider from the path prefix. The audit log
 	// needs the provider name, but a missing/unknown prefix is still
 	// audited: a request that fails here is exactly the kind of thing an
 	// operator wants to see (probe, misconfigured client, leaked port).
 	upstreamHost, provider := s.resolveUpstream(r.URL.Path)
+	if s.Metrics != nil {
+		s.Metrics.ObserveRequest(agent, provider)
+	}
 	if upstreamHost == "" {
 		if s.AuditLog != nil {
 			s.AuditLog.Record(audit.Entry{
@@ -242,17 +255,37 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Session identity: explicit header, else inferred from the
+	// conversation's own tokens, else a fingerprint of its opening.
+	session := vault.DeriveSession(r.Header.Get(SessionHeader), agent, body, s.Vault)
+
 	// Process the request through the router (classify, redact, route)
-	ctx, modifiedBody, blocked, err := s.Router.ProcessRequest(body, agent, provider)
+	ctx, modifiedBody, blocked, err := s.Router.ProcessRequestSession(body, agent, provider, session)
 	if err != nil {
 		// Fail-closed: do not forward unredacted content on router error
+		if s.Metrics != nil {
+			s.Metrics.IncFailClosed()
+		}
 		http.Error(w, "gateway processing error", http.StatusBadGateway)
 		return
+	}
+
+	if s.Metrics != nil && ctx != nil {
+		s.Metrics.ObserveTiers(ctx.Tiers)
+		s.Metrics.ObserveRedactions(ctx.Summary)
+		s.Metrics.AddCacheHits(ctx.CacheHits)
 	}
 
 	if blocked {
 		// Some content was blocked — the modified body contains block messages
 		// but we still forward so the agent gets a response
+		blockedCount := 0
+		if ctx != nil {
+			blockedCount = ctx.Tiers["blocked"]
+		}
+		if s.Metrics != nil {
+			s.Metrics.IncBlocked(blockedCount)
+		}
 		log.Printf("request from agent=%s had blocked content", agent)
 	}
 
@@ -281,6 +314,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Send to upstream with timeout
 	resp, err := upstreamClient.Do(upstreamReq)
 	if err != nil {
+		if s.Metrics != nil {
+			s.Metrics.IncUpstreamError()
+		}
 		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -406,7 +442,7 @@ func (s *Server) resolveUpstream(path string) (host string, provider string) {
 // headers like Cookie and Host.
 func isFilteredHeader(headerName string) bool {
 	// Tidegate-internal
-	if headerName == "X-Tidegate-Agent" || headerName == GatewayClientHeader {
+	if headerName == "X-Tidegate-Agent" || headerName == GatewayClientHeader || headerName == SessionHeader {
 		return true
 	}
 	// Per-connection / control headers

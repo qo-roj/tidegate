@@ -704,3 +704,92 @@ URL can be changed without code changes:
 TIDEGATE_MIRROR=https://git.zitronenkuchen.tail5156c1.ts.net/tidegate \
   bash install.sh
 ```
+---
+
+## Issue 10: Session Continuity (v0.7.0)
+
+### Problem
+
+The per-request redactor allocated tokens from a counter that restarted at 1
+on every request. Agents resend their own history — with originals — so the
+same token value could refer to two different secrets across turns. A token
+echoed from history then reverse-mapped to the wrong value:
+
+```
+turn 1: [TG:IP:1] = 203.0.113.42
+turn 2: [TG:IP:1] = 198.51.100.7  (history echo expanded to the new value)
+```
+
+This was demonstrated by a failing probe before the fix (regression test:
+`TestCrossTurnTokenCollision`).
+
+### Decision: Session-Scoped Vault
+
+A SQLite vault owns token numbering per conversation:
+
+- `tokens(session, token, category, original, expires, ...)` — stable,
+  per-session, expiring mappings
+- `counters(session, category, seq)` — monotonic allocation inside a
+  transaction, so concurrent requests cannot collide
+- Session identity: `X-Tidegate-Session` header → token ownership → opening
+  fingerprint → none
+- Reverse mapping is limited to tokens present in the incoming request
+  (defence against using the gateway as a value oracle)
+
+### Why Not Delta-Only Forwarding?
+
+The obvious optimisation — forward prior turns byte-for-byte and only process
+the newest message, as a context compressor would — is unsafe here. The agent
+stores and resends **originals**, so unprocessed history would reach the cloud
+unredacted. Every message is therefore still classified and redacted.
+
+Instead the cost is reduced with a **content-addressed redaction cache**:
+`sha256(block) + session + rule-set fingerprint → redacted form`. A hit is
+equivalent to recomputation by construction. This keeps history byte-identical
+across turns, which is also what provider prompt caches want.
+
+### Trade-offs
+
+- The vault holds plaintext originals at rest (`0600`, 24h TTL). Necessary for
+  multi-turn continuity; documented in the threat model.
+- A client that forks one conversation into parallel branches will reuse the
+  same session tokens. Values still resolve correctly; only numbering is shared.
+- Stateless calls (`tidegate text`, requests without messages) keep the old
+  per-request behaviour.
+
+---
+
+## Issue 11: Content-Shape Awareness (v0.7.0)
+
+### Problem
+
+Pure regex redaction is blind to structure. Two live defects came from this:
+
+- a phone pattern parsed `15:07:51.712345 2026` as NANP `712-345-2026`
+  (fixed narrowly in v0.6.3 by re-anchoring the regex)
+- hostnames leaked in positions the patterns did not model (DocumentRoot
+  paths, URL hosts — v0.6.2/0.6.3)
+
+Narrow regex fixes address instances; they do not address the class.
+
+### Decision: Detect Shape, Then Transform
+
+`internal/content.Detect` classifies a block as json / log / code / diff /
+text. Two transforms use the result:
+
+1. **JSON key redaction** — values under `password`, `api_key`,
+   `authorization`, `dsn`, cookie/session keys are replaced wholesale. This
+   catches base64 blobs, names, and connection strings no pattern recognises,
+   and the document is never re-encoded (raw `"key":"value"` rewrite + a
+   `json.Valid` check that discards a broken rewrite).
+2. **Timestamp shielding** — timestamp spans are swapped for inert sentinels
+   before pattern matching and restored afterwards. Patterns cannot fire
+   inside a timestamp, and the line keeps its exact bytes.
+
+Both preserve byte layout, so prompt prefixes stay stable.
+
+### Trade-off
+
+Detection is heuristic. A malformed or mixed document falls back to `text` and
+pattern-only redaction. JSON key redaction is deliberately conservative:
+only string values directly under a sensitive key, never whole objects.
