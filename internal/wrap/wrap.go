@@ -56,12 +56,13 @@ type keyState struct {
 }
 
 type entry struct {
-	Agent      string              `json:"agent"`
-	ConfigPath string              `json:"config_path"`
-	Created    bool                `json:"created"`
-	Mode       uint32              `json:"mode,omitempty"`
-	Backup     string              `json:"backup,omitempty"`
-	Keys       map[string]keyState `json:"keys,omitempty"`
+	Agent        string              `json:"agent"`
+	ConfigPath   string              `json:"config_path"`
+	Created      bool                `json:"created"`
+	Mode         uint32              `json:"mode,omitempty"`
+	Backup       string              `json:"backup,omitempty"`
+	AddedNewline bool                `json:"added_newline,omitempty"`
+	Keys         map[string]keyState `json:"keys,omitempty"`
 }
 
 type state struct {
@@ -377,11 +378,20 @@ const (
 	codexProviderEnd = "# <<< tidegate provider <<<"
 )
 
-func codexBlock(baseURL, key string) string {
+// codexHeaderBlock is the only part inserted at the top: a root-level key.
+// The provider table MUST go at EOF — TOML tables extend to the next header,
+// so placing it at the top would swallow the user's root keys (model, approval
+// policy, …) into [model_providers.tidegate].
+func codexHeaderBlock() string {
 	var b strings.Builder
 	b.WriteString(codexHeader + "\n")
 	b.WriteString("model_provider = \"tidegate\"\n")
-	b.WriteString(codexHeaderEnd + "\n\n")
+	b.WriteString(codexHeaderEnd + "\n")
+	return b.String()
+}
+
+func codexProviderBlock(baseURL, key string) string {
+	var b strings.Builder
 	b.WriteString("# >>> tidegate provider >>>\n")
 	b.WriteString(codexProvider + "\n")
 	b.WriteString("name = \"Tidegate\"\n")
@@ -424,7 +434,13 @@ func applyCodex(baseURL, key string, home string) (Result, error) {
 		}
 	}
 
-	out := codexBlock(baseURL, key) + "\n" + strings.TrimLeft(body, "\n")
+	out := codexHeaderBlock() + "\n" + strings.TrimLeft(body, "\n")
+	addedNewline := false
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+		addedNewline = true
+	}
+	out += codexProviderBlock(baseURL, key)
 	mode := os.FileMode(0644)
 	if key != "" {
 		mode = 0600
@@ -434,7 +450,7 @@ func applyCodex(baseURL, key string, home string) (Result, error) {
 	}
 
 	s := loadState(home)
-	e := entry{Agent: "codex", ConfigPath: path, Created: created}
+	e := entry{Agent: "codex", ConfigPath: path, Created: created, AddedNewline: addedNewline}
 	if !created {
 		e.Backup = backup
 		if info, err := os.Stat(path); err == nil {
@@ -471,6 +487,9 @@ func removeCodex(home string) (Result, error) {
 		out, err := stripMarkedBlocks(path)
 		if err != nil {
 			return Result{}, err
+		}
+		if e.AddedNewline && strings.HasSuffix(string(out), "\n") {
+			out = out[:len(out)-1]
 		}
 		mode := os.FileMode(0644)
 		if e.Mode != 0 {

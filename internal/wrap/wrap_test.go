@@ -234,3 +234,39 @@ func TestCodexRejectsDuplicateProviderTable(t *testing.T) {
 		t.Fatal("expected refusal when the provider table already exists")
 	}
 }
+
+// TestCodexRootKeysNotSwallowed is Sid's Q3 case: a standard Codex config
+// starts with root keys, so the provider table must go to EOF — a table
+// header at the top would absorb every root key that follows it.
+func TestCodexRootKeysNotSwallowed(t *testing.T) {
+	home := t.TempDir()
+	path := codexPath(home)
+	os.MkdirAll(filepath.Dir(path), 0755)
+	original := "model = \"gpt-5-codex\"\napproval_policy = \"on-request\"\n\n[profiles.fast]\nmodel = \"gpt-5\"\n"
+	os.WriteFile(path, []byte(original), 0644)
+
+	if _, err := Apply("codex", "http://127.0.0.1:8842/openai/v1", "", home); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	text := string(data)
+	modelIdx := strings.Index(text, `model = "gpt-5-codex"`)
+	tableIdx := strings.Index(text, "[model_providers.tidegate]")
+	if modelIdx < 0 || tableIdx < 0 {
+		t.Fatalf("missing pieces:\n%s", text)
+	}
+	if modelIdx > tableIdx {
+		t.Fatalf("root key fell under the provider table:\n%s", text)
+	}
+	if !strings.HasSuffix(text, "# <<< tidegate provider <<<\n") {
+		t.Fatalf("provider table must be last:\n%s", text)
+	}
+
+	if _, err := Remove("codex", home); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if string(data) != original {
+		t.Fatalf("round-trip mismatch:\n got %q\nwant %q", data, original)
+	}
+}
