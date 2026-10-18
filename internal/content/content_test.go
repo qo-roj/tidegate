@@ -200,3 +200,35 @@ func TestJSONSecretTimestampNotShielded(t *testing.T) {
 		t.Fatalf("out = %s", out)
 	}
 }
+
+func TestRedactJSONKeysNonStringValues(t *testing.T) {
+	cases := []string{
+		`{"password":123}`,
+		`{"token":true}`,
+		`{"api_key":{"nested":"x"}}`,
+		`{"authorization":[1,2,3]}`,
+	}
+	for _, src := range cases {
+		out, n := content.RedactJSONKeys(src, func(key, value string) string {
+			return "[TG:SECRET:1:00000000]"
+		})
+		if n != 1 {
+			t.Errorf("%s: replaced %d, want 1", src, n)
+			continue
+		}
+		if !json.Valid([]byte(out)) {
+			t.Errorf("%s: invalid output %s", src, out)
+		}
+		if !strings.Contains(out, "[TG:SECRET:1:00000000]") {
+			t.Errorf("%s: token missing in %s", src, out)
+		}
+	}
+}
+
+func TestRedactJSONKeysPreservesOtherTypes(t *testing.T) {
+	src := `{"count":3,"ok":true,"note":"keep"}`
+	out, n := content.RedactJSONKeys(src, func(key, value string) string { return "[TG:X:1:00000000]" })
+	if n != 0 || out != src {
+		t.Fatalf("n=%d out=%s", n, out)
+	}
+}

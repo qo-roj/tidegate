@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/qo-roj/tidegate/internal/audit"
 	"github.com/qo-roj/tidegate/internal/classify"
@@ -300,6 +301,9 @@ func ApplyShapeRedaction(src string, reqRedactor *redact.Redactor) (string, reda
 	// real value, never a timestamp sentinel.
 	work := src
 	if content.Detect(src) == content.KindJSON {
+		// "\/" is a legal JSON spelling of "/"; patterns expect the plain
+		// form (e.g. url_hostname needs "://"). Semantics are unchanged.
+		work = strings.ReplaceAll(work, `\/`, "/")
 		var n int
 		work, n = content.RedactJSONKeys(work, func(key, value string) string {
 			return reqRedactor.Allocate("SECRET", value)

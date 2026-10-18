@@ -223,3 +223,14 @@ func TestCodexPreservesMode(t *testing.T) {
 		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
 	}
 }
+
+func TestCodexRejectsDuplicateProviderTable(t *testing.T) {
+	home := t.TempDir()
+	path := codexPath(home)
+	os.MkdirAll(filepath.Dir(path), 0755)
+	os.WriteFile(path, []byte("[model_providers.tidegate]\nname = \"x\"\n"), 0644)
+
+	if _, err := Apply("codex", "http://127.0.0.1:8842/openai/v1", "", home); err == nil {
+		t.Fatal("expected refusal when the provider table already exists")
+	}
+}

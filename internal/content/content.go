@@ -98,6 +98,7 @@ var sensitiveKeys = map[string]bool{
 	"accesstoken":        true,
 	"refreshtoken":       true,
 	"idtoken":            true,
+	"token":              true,
 	"authtoken":          true,
 	"authorization":      true,
 	"bearer":             true,
@@ -124,18 +125,20 @@ func IsSensitiveKey(key string) bool {
 	return sensitiveKeys[norm]
 }
 
-// jsonStringKV matches "key": "value" pairs in raw JSON without re-encoding
-// the document. Group 1 is the key, group 2 the value; either may contain
-// escapes.
-var jsonStringKV = regexp.MustCompile(`"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"`)
+// jsonKey matches a JSON object key and its colon. Values are located with a
+// small scanner so strings, numbers, booleans, nulls, objects and arrays all
+// come under a sensitive key — not just string values.
+var jsonKey = regexp.MustCompile(`"((?:[^"\\]|\\.)*)"\s*:`)
 
 // RedactJSONKeys replaces the value of every sensitive JSON key using fn.
 // It returns the rewritten document and the number of values replaced.
 //
-// fn receives the decoded key and the decoded value. The returned string is
-// inserted verbatim, so it must be JSON-string-safe (Tidegate tokens are).
+// fn receives the decoded key and the value as text (JSON is decoded for
+// strings; numbers/booleans/null keep their literal form; objects and arrays
+// keep their raw JSON). Tokens replace string values in place and are quoted
+// for every other type, so the document stays valid.
 func RedactJSONKeys(src string, fn func(key, value string) string) (string, int) {
-	matches := jsonStringKV.FindAllStringSubmatchIndex(src, -1)
+	matches := jsonKey.FindAllStringSubmatchIndex(src, -1)
 	if len(matches) == 0 {
 		return src, 0
 	}
@@ -145,27 +148,49 @@ func RedactJSONKeys(src string, fn func(key, value string) string) (string, int)
 	count := 0
 	for _, m := range matches {
 		keyStart, keyEnd := m[2], m[3]
-		valueStart, valueEnd := m[4], m[5]
-		if keyStart < 0 || keyEnd < 0 || valueStart < 0 || valueEnd < 0 {
+		if keyStart < 0 || keyEnd < 0 {
 			continue
 		}
 		key, err := unquoteJSON(src[keyStart:keyEnd])
-		if err != nil {
+		if err != nil || !IsSensitiveKey(key) {
 			continue
 		}
-		if !IsSensitiveKey(key) {
+
+		valueStart := skipJSONSpace(src, m[1])
+		if valueStart >= len(src) {
 			continue
 		}
-		value, err := unquoteJSON(src[valueStart:valueEnd])
-		if err != nil {
+		valueEnd, isString := scanJSONValue(src, valueStart)
+		if valueEnd <= valueStart {
 			continue
 		}
-		if value == "" || strings.HasPrefix(value, "[TG:") {
+
+		var value string
+		if isString {
+			if valueEnd-valueStart < 2 {
+				continue
+			}
+			value, err = unquoteJSON(src[valueStart+1 : valueEnd-1])
+			if err != nil {
+				continue
+			}
+		} else {
+			value = strings.TrimSpace(src[valueStart:valueEnd])
+		}
+		if value == "" || value == "null" || strings.HasPrefix(value, "[TG:") {
 			continue
 		}
-		b.WriteString(src[last:valueStart])
-		b.WriteString(fn(key, value))
-		last = valueEnd
+
+		token := fn(key, value)
+		if isString {
+			b.WriteString(src[last : valueStart+1])
+			b.WriteString(token)
+			last = valueEnd - 1
+		} else {
+			b.WriteString(src[last:valueStart])
+			b.WriteString(`"` + token + `"`)
+			last = valueEnd
+		}
 		count++
 	}
 	if count == 0 {
@@ -179,6 +204,65 @@ func RedactJSONKeys(src string, fn func(key, value string) string) (string, int)
 		return out, count
 	}
 	return src, 0
+}
+
+func skipJSONSpace(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	return i
+}
+
+// scanJSONValue returns the exclusive end of the JSON value starting at i and
+// whether that value is a string.
+func scanJSONValue(s string, i int) (int, bool) {
+	if i >= len(s) {
+		return i, false
+	}
+	if s[i] == '"' {
+		j := i + 1
+		for j < len(s) {
+			if s[j] == '\\' {
+				j += 2
+				continue
+			}
+			if s[j] == '"' {
+				return j + 1, true
+			}
+			j++
+		}
+		return i, false
+	}
+	if s[i] == '{' || s[i] == '[' {
+		depth := 0
+		for j := i; j < len(s); j++ {
+			switch s[j] {
+			case '"':
+				j++
+				for j < len(s) {
+					if s[j] == '\\' {
+						j++
+					} else if s[j] == '"' {
+						break
+					}
+					j++
+				}
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return j + 1, false
+				}
+			}
+		}
+		return i, false
+	}
+	j := i
+	for j < len(s) && !strings.ContainsRune(",}] \t\n\r", rune(s[j])) {
+		j++
+	}
+	return j, false
 }
 
 // unquoteJSON decodes a JSON string body (without the surrounding quotes).

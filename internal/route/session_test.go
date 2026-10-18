@@ -205,3 +205,22 @@ func TestJSONSecretWithTimestampRoundTrips(t *testing.T) {
 		t.Fatalf("restore = %q, want %q", got, src)
 	}
 }
+
+// TestJSONEscapedSlashIsNormalized: "https:\/\/host" must still hit the URL
+// hostname pattern; the escape is legal JSON but invisible to the regex.
+func TestJSONEscapedSlashIsNormalized(t *testing.T) {
+	r := routerForShapeTests(t)
+	src := `{"note":"see https:\/\/myhost.com\/x"}`
+	out, summary := ApplyShapeRedaction(src, r)
+	if summary["url_hostname"] == 0 {
+		t.Fatalf("url_hostname did not fire on escaped slash: %v (%s)", summary, out)
+	}
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("invalid JSON: %s", out)
+	}
+}
+
+func routerForShapeTests(t *testing.T) *redact.Redactor {
+	t.Helper()
+	return redact.NewWithNames(redact.PatternNames())
+}

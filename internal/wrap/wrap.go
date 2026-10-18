@@ -410,6 +410,9 @@ func applyCodex(baseURL, key string, home string) (Result, error) {
 	if hasTOMLKey(body, "model_provider") {
 		return Result{}, fmt.Errorf("%s already sets model_provider; point it at the tidegate provider manually", path)
 	}
+	if hasTOMLTable(body, "model_providers.tidegate") {
+		return Result{}, fmt.Errorf("%s already defines [model_providers.tidegate]; remove it before wrapping", path)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return Result{}, err
@@ -516,6 +519,23 @@ func stripMarkedBlocks(path string) ([]byte, error) {
 		out = out[1:]
 	}
 	return []byte(strings.Join(out, "\n")), nil
+}
+
+// hasTOMLTable reports whether a table header already exists (any spacing or
+// quoted form of the name).
+func hasTOMLTable(body, table string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "[") {
+			continue
+		}
+		name := strings.TrimSpace(strings.Trim(trimmed, "[]"))
+		name = strings.ReplaceAll(name, `"`, "")
+		if name == table {
+			return true
+		}
+	}
+	return false
 }
 
 // hasTOMLKey reports whether a top-level key is already set.
