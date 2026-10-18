@@ -434,6 +434,9 @@ func applyCodex(baseURL, key string, home string) (Result, error) {
 	e := entry{Agent: "codex", ConfigPath: path, Created: created}
 	if !created {
 		e.Backup = backup
+		if info, err := os.Stat(path); err == nil {
+			e.Mode = uint32(info.Mode().Perm())
+		}
 	}
 	s.Entries["codex"] = e
 	if err := saveState(home, s); err != nil {
@@ -466,7 +469,11 @@ func removeCodex(home string) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		if err := os.WriteFile(path, out, 0644); err != nil {
+		mode := os.FileMode(0644)
+		if e.Mode != 0 {
+			mode = os.FileMode(e.Mode)
+		}
+		if err := os.WriteFile(path, out, mode); err != nil {
 			return Result{}, err
 		}
 		if e.Backup != "" {

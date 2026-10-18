@@ -19,12 +19,10 @@ type StreamRedactor struct {
 	maxBuffer int
 }
 
-// partialTokenStart matches a potential partial TG token at the end of a string.
-// Only matches [TG: prefixed partial tokens, not arbitrary opening brackets.
-var partialTokenStart = regexp.MustCompile(`\[TG:[A-Z]*:?[0-9]*$`)
-
-// tokenFullRegex matches complete [TG:CATEGORY:N] tokens anywhere in the string.
-var tokenFullRegex = regexp.MustCompile(`\[TG:[A-Z]+:\d+\]`)
+// partialTokenStart matches a potential partial TG token at the end of a
+// string, including a partially streamed MAC suffix. Only matches [TG:
+// prefixed partial tokens, not arbitrary opening brackets.
+var partialTokenStart = regexp.MustCompile(`\[TG:[A-Z0-9_]*(?::[0-9]*)?(?::[0-9a-f]*)?$`)
 
 // NewStreamRedactor creates a StreamRedactor from a TokenMatcher.
 func NewStreamRedactor(matcher *TokenMatcher) *StreamRedactor {

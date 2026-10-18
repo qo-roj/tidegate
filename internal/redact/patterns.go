@@ -1,6 +1,11 @@
 package redact
 
-import "regexp"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"regexp"
+)
 
 // DefaultPatterns returns the built-in redaction patterns enabled by default.
 // These cover the patterns described in rules/defaults.conf.
@@ -352,6 +357,25 @@ var defaultPatternSet = func() map[string]bool {
 // (enabled out of the box).
 func IsDefaultPattern(name string) bool {
 	return defaultPatternSet[name]
+}
+
+// Fingerprint hashes the active pattern set — names AND regex bodies — so a
+// regex fix invalidates cached redaction output instead of serving stale
+// results for the cache TTL. nil/empty names means "all patterns".
+func Fingerprint(names []string) string {
+	enabled := make(map[string]bool, len(names))
+	for _, n := range names {
+		enabled[n] = true
+	}
+	// AllPatterns is deterministic (declaration order).
+	h := sha256.New()
+	for _, p := range AllPatterns() {
+		if len(names) > 0 && !enabled[p.Name] {
+			continue
+		}
+		fmt.Fprintf(h, "%s|%s|%s|%d\n", p.Name, p.Regex.String(), p.Category, p.Group)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:8]
 }
 
 // NewWithNames creates a Redactor with the named patterns enabled (plus the

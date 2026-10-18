@@ -42,8 +42,8 @@ func TestRedactDistinctValuesGetDistinctTokens(t *testing.T) {
 	}
 
 	// Two distinct IPs should get two distinct tokens
-	tokenA := "[TG:IP:1]"
-	tokenB := "[TG:IP:2]"
+	tokenA := "[TG:IP:1:00000000]"
+	tokenB := "[TG:IP:2:00000000]"
 	if !strings.Contains(redacted, tokenA) {
 		t.Errorf("expected token %s in redacted output: %s", tokenA, redacted)
 	}
@@ -289,7 +289,7 @@ func TestDeduplication(t *testing.T) {
 		t.Errorf("expected 1 mapping entry (dedup), got %d", r.MappingCount())
 	}
 	// All occurrences should be the same token
-	token := "[TG:IP:1]"
+	token := "[TG:IP:1:00000000]"
 	count := strings.Count(redacted, token)
 	if count != 3 {
 		t.Errorf("expected 3 occurrences of same token, got %d", count)

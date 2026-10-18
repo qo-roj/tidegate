@@ -97,12 +97,12 @@ passwd_username = true
 	red := r.newRedactor()
 
 	out, _ := red.Redact("Sep  3 17:54:01 himbeerkuchen systemd[1]: Started apt.\n")
-	if !strings.Contains(out, "Sep  3 17:54:01 [TG:HOST:1] systemd[1]") {
+	if !strings.Contains(out, "Sep  3 17:54:01 [TG:HOST:1:00000000] systemd[1]") {
 		t.Errorf("syslog_hostname toggle inactive: %q", out)
 	}
 
 	out, _ = red.Redact("sid:x:1000:1000:Sid:/home/sid:/usr/bin/fish\n")
-	if !strings.HasPrefix(out, "[TG:USER:1]:x:1000:1000:") {
+	if !strings.HasPrefix(out, "[TG:USER:1:00000000]:x:1000:1000:") {
 		t.Errorf("passwd_username toggle inactive: %q", out)
 	}
 }
@@ -127,7 +127,7 @@ accesslog_hostname = true
 	// tokenized by ipv4 (which runs earlier). Both tokens in one line is
 	// exactly the fixed behavior.
 	out, _ := red.Redact(in)
-	if !strings.HasPrefix(out, "[TG:HOST:1]:443 [TG:IP:1] - - [01/Oct/2026:14:44:22 +0200]") {
+	if !strings.HasPrefix(out, "[TG:HOST:1:00000000]:443 [TG:IP:1:00000000] - - [01/Oct/2026:14:44:22 +0200]") {
 		t.Errorf("accesslog_hostname toggle inactive: %q", out)
 	}
 	if strings.Contains(out, "myhost.com") {

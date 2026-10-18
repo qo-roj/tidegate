@@ -8,12 +8,35 @@
 package redact
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"log"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 )
+
+// StatelessTokenSuffix marks tokens allocated without a session vault. It is
+// deliberately constant: per-request mappings are never resolvable outside
+// the request that created them.
+const StatelessTokenSuffix = "00000000"
+
+// randomHex returns n random hex characters.
+func randomHex(n int) string {
+	buf := make([]byte, (n+1)/2)
+	if _, err := rand.Read(buf); err != nil {
+		return strings.Repeat("0", n)
+	}
+	return hex.EncodeToString(buf)[:n]
+}
+
+// randomToken builds a syntactically valid token that has no vault mapping,
+// so it stays redacted but cannot be restored.
+func randomToken(category string) string {
+	return fmt.Sprintf("[TG:%s:0:%s]", category, randomHex(8))
+}
 
 // Pattern defines a single redaction pattern.
 type Pattern struct {
@@ -85,8 +108,9 @@ func (r *Redactor) Session() string {
 	return r.session
 }
 
-// tokenRe matches the canonical Tidegate token shape.
-var tokenRe = regexp.MustCompile(`\[TG:[A-Z0-9_]+:[0-9]+\]`)
+// tokenRe matches the canonical Tidegate token shape, including the
+// session-bound MAC suffix.
+var tokenRe = regexp.MustCompile(`\[TG:[A-Z0-9_]+:[0-9]+:[0-9a-f]{8}\]`)
 
 // NoteTokens records every Tidegate token present in content as "seen" for
 // this request. Call it for incoming conversation history so historical
@@ -319,18 +343,27 @@ func (r *Redactor) allocateCategory(category, original string) string {
 	// seen in an earlier turn gets the token it already had.
 	var token string
 	if r.store != nil && r.session != "" {
-		if t, err := r.store.Token(r.session, category, original); err == nil {
+		t, err := r.store.Token(r.session, category, original)
+		if err == nil {
 			token = t
+		} else {
+			// Do NOT fall back to in-memory numbering: it would re-issue
+			// [TG:CAT:1] for a different value and corrupt the restore of
+			// history tokens. A random, non-restorable token keeps the
+			// content redacted and cannot collide.
+			log.Printf("redact: token store unavailable, using non-restorable token: %v", err)
+			token = randomToken(category)
 		}
-		// On error fall through to in-memory allocation: losing continuity
-		// is preferable to losing redaction.
 	}
 
 	if token == "" {
+		// No store: per-request numbering (stateless mode). The suffix is a
+		// fixed marker, not a secret: the mapping exists only for this one
+		// request, so a guessed token can never resolve anything.
 		for {
 			n := r.counters[category] + 1
 			r.counters[category] = n
-			candidate := fmt.Sprintf("[TG:%s:%d]", category, n)
+			candidate := fmt.Sprintf("[TG:%s:%d:%s]", category, n, StatelessTokenSuffix)
 			if _, exists := r.mapping[candidate]; !exists {
 				token = candidate
 				break

@@ -202,3 +202,24 @@ func TestDefaultBaseURL(t *testing.T) {
 		t.Fatalf("opencode base = %q", got)
 	}
 }
+
+func TestCodexPreservesMode(t *testing.T) {
+	home := t.TempDir()
+	path := codexPath(home)
+	os.MkdirAll(filepath.Dir(path), 0755)
+	os.WriteFile(path, []byte("model = \"gpt-5-codex\"\n"), 0600)
+
+	if _, err := Apply("codex", "http://127.0.0.1:8842/openai/v1", "", home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Remove("codex", home); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
+	}
+}

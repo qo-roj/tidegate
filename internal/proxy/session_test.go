@@ -34,7 +34,7 @@ func TestProxySessionStableTokens(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("turn 1 status %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(string(upstream.receivedBody), "[TG:IP:1]") {
+	if !strings.Contains(string(upstream.receivedBody), "[TG:IP:1:00000000]") {
 		t.Fatalf("turn 1 upstream body: %s", upstream.receivedBody)
 	}
 	if upstream.receivedHeaders.Get("X-Tidegate-Session") != "" {
@@ -62,10 +62,10 @@ func TestProxySessionStableTokens(t *testing.T) {
 	if err := json.Unmarshal(upstream.receivedBody, &sent); err != nil {
 		t.Fatalf("upstream body: %v (%s)", err, upstream.receivedBody)
 	}
-	if !strings.Contains(sent.Messages[0].Content, "[TG:IP:1]") {
+	if !strings.Contains(sent.Messages[0].Content, "[TG:IP:1:00000000]") {
 		t.Fatalf("history token changed: %q", sent.Messages[0].Content)
 	}
-	if !strings.Contains(sent.Messages[2].Content, "[TG:IP:2]") {
+	if !strings.Contains(sent.Messages[2].Content, "[TG:IP:2:00000000]") {
 		t.Fatalf("new value token wrong: %q", sent.Messages[2].Content)
 	}
 	if strings.Contains(string(upstream.receivedBody), "203.0.113.42") {
@@ -91,7 +91,7 @@ func TestProxySessionInferredFromTokens(t *testing.T) {
 
 	second := makeChatBody(t, []map[string]interface{}{
 		{"role": "user", "content": "log /var/log/app.log host 203.0.113.42"},
-		{"role": "assistant", "content": "the host was [TG:IP:1]"},
+		{"role": "assistant", "content": "the host was [TG:IP:1:00000000]"},
 		{"role": "user", "content": "and the new one?"},
 	})
 	req := makeChatRequest(t, second, "openai")
@@ -106,7 +106,7 @@ func TestProxySessionInferredFromTokens(t *testing.T) {
 	if err := json.Unmarshal(upstream.receivedBody, &sent); err != nil {
 		t.Fatalf("upstream body: %v", err)
 	}
-	if !strings.Contains(sent.Messages[1].Content, "[TG:IP:1]") {
+	if !strings.Contains(sent.Messages[1].Content, "[TG:IP:1:00000000]") {
 		t.Fatalf("assistant history token was re-mapped: %q", sent.Messages[1].Content)
 	}
 }
@@ -171,14 +171,14 @@ func TestGatewayClientCannotAdoptAnotherClientsSession(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("alice status %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(string(upstream.receivedBody), "[TG:IP:1]") {
+	if !strings.Contains(string(upstream.receivedBody), "[TG:IP:1:00000000]") {
 		t.Fatalf("alice body: %s", upstream.receivedBody)
 	}
 
 	// Bob guesses the token and even reuses the session header name.
-	upstream.responseBody = `{"text":"the host is [TG:IP:1]"}`
+	upstream.responseBody = `{"text":"the host is [TG:IP:1:00000000]"}`
 	bobBody := makeChatBody(t, []map[string]interface{}{
-		{"role": "user", "content": "what is [TG:IP:1]?"},
+		{"role": "user", "content": "what is [TG:IP:1:00000000]?"},
 	})
 	req = makeChatRequest(t, bobBody, "openai")
 	req.Header.Set("X-Tidegate-Key", "key-b")

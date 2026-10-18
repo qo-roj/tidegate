@@ -60,17 +60,28 @@ spoofable labels for rules and audit only.
 
 ### Tokens are not bearer capabilities
 
-Tokens look like `[TG:IP:1]` — deliberately readable, and therefore guessable.
+Tokens look like `[TG:IP:1:9f3c1a2b]` — a readable label plus an 8-hex MAC
+suffix. The suffix is `HMAC-SHA256(vault_secret, session ‖ category ‖ seq ‖
+original)`, so it cannot be forged without the vault's key.
 Early v0.7.0 builds adopted a session when a request carried tokens owned by
 exactly one known session. That made a guessed token a bearer credential: any
 key-holding gateway client could echo `[TG:IP:1]`, be adopted, and receive the
 original in the restored response (cross-principal disclosure).
 
-Fixed before release: adoption and restore are bound to session ownership, and
-a session id is derived per identity (the same `X-Tidegate-Session` value from
-two clients produces two sessions). A foreign or guessed token now stays
-opaque. Regression tests: `TestAdoptionRequiresSameIdentity`,
-`TestHeaderIsIdentityBound`, `TestGatewayClientCannotAdoptAnotherClientsSession`.
+Fixed before release in two layers:
+
+1. **Ownership** — adoption and restore are bound to session ownership, and a
+   session id is derived per identity (the same `X-Tidegate-Session` value from
+   two clients produces two sessions).
+2. **Unguessable tokens** — every vault token carries a MAC suffix computed
+   with a per-vault secret. A forged `[TG:IP:1:00000000]` resolves to nothing,
+   even inside the owning session. Stateless (no-vault) tokens use a constant
+   `00000000` suffix, which is safe because their mapping lives for exactly one
+   request.
+
+Regression tests: `TestAdoptionRequiresSameIdentity`, `TestHeaderIsIdentityBound`,
+`TestGatewayClientCannotAdoptAnotherClientsSession`, `TestTokenShapeIsUnguessable`,
+`TestExpiredTokenIsNotReissued`, `TestRestoreExpandsNestedTokens`.
 
 Binding identity is sufficient because the remaining local case — one user's
 agents sharing a machine — is one principal: those agents can already read the

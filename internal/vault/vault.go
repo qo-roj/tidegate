@@ -15,6 +15,8 @@
 package vault
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -38,8 +40,9 @@ type Vault struct {
 	db  *sql.DB
 	ttl time.Duration
 
-	mu  sync.Mutex // serializes allocate/read-modify-write sequences
-	now func() time.Time
+	mu     sync.Mutex // serializes allocate/read-modify-write sequences
+	now    func() time.Time
+	secret []byte // per-vault HMAC key for unguessable tokens
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -68,6 +71,16 @@ func Open(path string, ttl time.Duration) (*Vault, error) {
 	if err := os.Chmod(path, 0600); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("securing vault file: %w", err)
+	}
+	if err := v.loadOrCreateSecret(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// WAL sidecars hold the same plaintext; SQLite creates them 0644.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(path+suffix, 0600); err == nil {
+			// exists and secured
+		}
 	}
 
 	v.wg.Add(1)
@@ -113,6 +126,10 @@ func (v *Vault) migrate() error {
 			seq      INTEGER NOT NULL,
 			PRIMARY KEY (session, category)
 		)`,
+		`CREATE TABLE IF NOT EXISTS meta (
+			key   TEXT PRIMARY KEY,
+			value BLOB NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS session_owners (
 			id       TEXT PRIMARY KEY,
 			identity TEXT NOT NULL,
@@ -149,6 +166,38 @@ func (v *Vault) Close() error {
 	return v.db.Close()
 }
 
+// loadOrCreateSecret generates the per-vault HMAC key used to make tokens
+// unguessable. The key lives in the vault DB, which is owner-only; a token
+// without a valid suffix is never resolvable, so a guessed [TG:IP:1] is inert.
+func (v *Vault) loadOrCreateSecret() error {
+	var secret []byte
+	err := v.db.QueryRow(`SELECT value FROM meta WHERE key = 'token_secret'`).Scan(&secret)
+	if err == sql.ErrNoRows {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return fmt.Errorf("vault secret: %w", err)
+		}
+		if _, err := v.db.Exec(`INSERT INTO meta (key, value) VALUES ('token_secret', ?)`, secret); err != nil {
+			return fmt.Errorf("vault secret write: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("vault secret read: %w", err)
+	}
+	if len(secret) < 16 {
+		return fmt.Errorf("vault secret too short (%d bytes)", len(secret))
+	}
+	v.secret = secret
+	return nil
+}
+
+// tokenMAC returns the 8-hex-char suffix binding a token to its session,
+// category, sequence and original value.
+func (v *Vault) tokenMAC(session, category string, seq int64, original string) string {
+	mac := hmac.New(sha256.New, v.secret)
+	fmt.Fprintf(mac, "%s|%s|%d|%s", session, category, seq, original)
+	return hex.EncodeToString(mac.Sum(nil))[:8]
+}
+
 // normalizeCategory turns an arbitrary label into a token-safe category.
 func normalizeCategory(c string) string {
 	c = strings.ToUpper(strings.TrimSpace(c))
@@ -179,8 +228,8 @@ func (v *Vault) Token(session, category, original string) (string, error) {
 
 	var token string
 	err := v.db.QueryRow(
-		`SELECT token FROM tokens WHERE session = ? AND category = ? AND original = ?`,
-		session, category, original,
+		`SELECT token FROM tokens WHERE session = ? AND category = ? AND original = ? AND expires >= ?`,
+		session, category, original, now.Unix(),
 	).Scan(&token)
 	if err == nil {
 		_, _ = v.db.Exec(`UPDATE tokens SET last_used = ? WHERE session = ? AND token = ?`, now.Unix(), session, token)
@@ -188,6 +237,11 @@ func (v *Vault) Token(session, category, original string) (string, error) {
 	}
 	if err != sql.ErrNoRows {
 		return "", fmt.Errorf("vault lookup: %w", err)
+	}
+	// An expired row must not be re-issued: drop it so the value gets a fresh
+	// token and expiry instead of an unusable one.
+	if _, err := v.db.Exec(`DELETE FROM tokens WHERE session = ? AND category = ? AND original = ?`, session, category, original); err != nil {
+		return "", fmt.Errorf("vault expired cleanup: %w", err)
 	}
 
 	tx, err := v.db.Begin()
@@ -213,7 +267,7 @@ func (v *Vault) Token(session, category, original string) (string, error) {
 		}
 	}
 
-	token = fmt.Sprintf("[TG:%s:%d]", category, seq)
+	token = fmt.Sprintf("[TG:%s:%d:%s]", category, seq, v.tokenMAC(session, category, seq, original))
 	if _, err := tx.Exec(
 		`INSERT INTO tokens (session, token, category, original, created, expires, last_used) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		session, token, category, original, now.Unix(), now.Add(v.ttl).Unix(), now.Unix(),
@@ -428,8 +482,9 @@ func (v *Vault) StoreRedaction(session, ruleset, hash, redacted, summary string)
 	return nil
 }
 
-// tokenRe matches the canonical Tidegate token shape.
-var tokenRe = regexp.MustCompile(`\[TG:[A-Z0-9_]+:[0-9]+\]`)
+// tokenRe matches the canonical Tidegate token shape, including the
+// session-bound MAC suffix ([TG:IP:1:9f3c1a2b]).
+var tokenRe = regexp.MustCompile(`\[TG:[A-Z0-9_]+:[0-9]+:[0-9a-f]{8}\]`)
 
 // TokensIn extracts every Tidegate token appearing in content.
 func TokensIn(content string) []string {
@@ -503,10 +558,19 @@ func DeriveAndClaim(header, identity string, body []byte, v *Vault) string {
 // as the conversation grows, which is what makes the fingerprint stable.
 func conversationPrefix(body []byte) string {
 	var req struct {
+		System   interface{}   `json:"system"`
 		Messages []interface{} `json:"messages"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
 		return ""
+	}
+	// Anthropic carries the system prompt outside messages; including it
+	// keeps conversations with different system prompts in separate sessions.
+	if sys := contentString(req.System); sys != "" {
+		if len(sys) > 4096 {
+			sys = sys[:4096]
+		}
+		req.Messages = append([]interface{}{map[string]interface{}{"role": "system", "content": sys}}, req.Messages...)
 	}
 	firstSystem := ""
 	firstOther := ""

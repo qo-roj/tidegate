@@ -15,7 +15,7 @@ func TestWriteTextOutputForces0600OnExistingFile(t *testing.T) {
 	if err := os.WriteFile(p, []byte("old world-readable content"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeTextOutput("redacted [TG:EMAIL:1] content", p); err != nil {
+	if err := writeTextOutput("redacted [TG:EMAIL:1:00000000] content", p); err != nil {
 		t.Fatalf("writeTextOutput: %v", err)
 	}
 	info, err := os.Stat(p)
@@ -29,7 +29,7 @@ func TestWriteTextOutputForces0600OnExistingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "redacted [TG:EMAIL:1] content" {
+	if string(data) != "redacted [TG:EMAIL:1:00000000] content" {
 		t.Errorf("content = %q", data)
 	}
 }

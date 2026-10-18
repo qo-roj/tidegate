@@ -760,7 +760,23 @@ Fix: sessions are owned by the authenticated identity (`client:<key-name>` in
 gateway mode, `local` otherwise), never by the spoofable `X-Tidegate-Agent`
 header. Adoption queries are filtered by ownership, and the session-header hash
 includes the identity, so two clients using the same header value get different
-sessions. Regression tests cover vault and proxy paths.
+sessions. Tokens also carry a per-vault HMAC suffix (`[TG:IP:1:9f3c1a2b]`), so
+possession of a guessed label never stands in for authentication.
+
+Same review round, also fixed:
+
+- token-store failure no longer falls back to in-memory numbering (which could
+  re-issue `[TG:CAT:1]` for a different value); it emits a random,
+  non-restorable token instead
+- `TokenMatcher.Restore` now expands nested tokens, matching `Redactor.Restore`
+- expired tokens are deleted and re-issued with a fresh expiry, not returned
+- the cache fingerprint hashes pattern regexes, not just names, so a regex fix
+  invalidates cached output
+- timestamp shielding runs after JSON key redaction, so sentinels never reach
+  the vault as stored originals
+- Codex unwrap restores the original file mode
+- the session fingerprint includes Anthropic's top-level `system` field
+- vault sidecars are chmodded `0600` and the data directory is `0700`
 
 ### Trade-offs
 

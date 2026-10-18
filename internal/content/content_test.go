@@ -39,7 +39,7 @@ func TestRedactJSONKeys(t *testing.T) {
 	var seen []string
 	out, n := content.RedactJSONKeys(src, func(key, value string) string {
 		seen = append(seen, key+"="+value)
-		return "[TG:SECRET:1]"
+		return "[TG:SECRET:1:00000000]"
 	})
 	if n != 2 {
 		t.Fatalf("replaced %d values, want 2 (%v)", n, seen)
@@ -63,7 +63,7 @@ func TestRedactJSONKeysEscapedValue(t *testing.T) {
 	var got string
 	out, n := content.RedactJSONKeys(src, func(key, value string) string {
 		got = value
-		return "[TG:SECRET:2]"
+		return "[TG:SECRET:2:00000000]"
 	})
 	if n != 1 || got != `pa"ss\word` {
 		t.Fatalf("n=%d value=%q", n, got)
@@ -85,7 +85,7 @@ func TestRedactJSONKeysEscapingRoundTrip(t *testing.T) {
 		var stored string
 		out, n := content.RedactJSONKeys(src, func(key, value string) string {
 			stored = value
-			return "[TG:SECRET:1]"
+			return "[TG:SECRET:1:00000000]"
 		})
 		if n != 1 {
 			t.Errorf("%s: replaced %d", src, n)
@@ -104,8 +104,8 @@ func TestRedactJSONKeysEscapingRoundTrip(t *testing.T) {
 }
 
 func TestRedactJSONKeysSkipsTokensAndEmpty(t *testing.T) {
-	src := `{"token":"[TG:SECRET:1]","secret":"","password":null}`
-	out, n := content.RedactJSONKeys(src, func(key, value string) string { return "[TG:SECRET:9]" })
+	src := `{"token":"[TG:SECRET:1:00000000]","secret":"","password":null}`
+	out, n := content.RedactJSONKeys(src, func(key, value string) string { return "[TG:SECRET:9:00000000]" })
 	if n != 0 || out != src {
 		t.Fatalf("n=%d out=%s", n, out)
 	}
@@ -175,5 +175,28 @@ func TestShieldPreventsPhoneFalsePositive(t *testing.T) {
 	}
 	if !strings.Contains(restore(redacted), "15:07:51.712345") {
 		t.Fatalf("timestamp lost: %q", restore(redacted))
+	}
+}
+
+// TestJSONSecretTimestampNotShielded ensures timestamp sentinels never leak
+// into stored originals when a sensitive JSON value contains a timestamp.
+func TestJSONSecretTimestampNotShielded(t *testing.T) {
+	src := `{"password":"issued 2026-10-01T15:07:51Z","x":1}`
+	var stored string
+	out, n := content.RedactJSONKeys(src, func(key, value string) string {
+		stored = value
+		return "[TG:SECRET:1:00000000]"
+	})
+	if n != 1 {
+		t.Fatalf("replaced %d", n)
+	}
+	if strings.ContainsRune(stored, 0x7f) {
+		t.Fatalf("sentinel leaked into stored original: %q", stored)
+	}
+	if stored != "issued 2026-10-01T15:07:51Z" {
+		t.Fatalf("stored = %q", stored)
+	}
+	if !strings.Contains(out, "[TG:SECRET:1:00000000]") {
+		t.Fatalf("out = %s", out)
 	}
 }

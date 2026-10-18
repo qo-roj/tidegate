@@ -199,7 +199,11 @@ func cmdStart(args []string) {
 	// Initialize audit log
 	home, _ := os.UserHomeDir()
 	dataDir := filepath.Join(home, ".local", "share", "tidegate")
-	os.MkdirAll(dataDir, 0700)
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating data directory: %v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Chmod(dataDir, 0700) // tighten an existing 0755 directory
 	dbPath := filepath.Join(dataDir, "audit.db")
 	auditLog, err := audit.New(dbPath)
 	if err != nil {

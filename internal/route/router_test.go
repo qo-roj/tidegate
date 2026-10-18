@@ -165,7 +165,7 @@ func TestProcessResponseTokenRestore(t *testing.T) {
 	ctx := &RequestContext{Redactor: redactor}
 
 	// Simulate a cloud response that includes tokens
-	responseBody := `{"content": "The IP [TG:IP:1] is reachable and email [TG:EMAIL:1] is valid"}`
+	responseBody := `{"content": "The IP [TG:IP:1:00000000] is reachable and email [TG:EMAIL:1:00000000] is valid"}`
 
 	processed := router.ProcessResponse(ctx, []byte(responseBody))
 
@@ -260,14 +260,14 @@ func TestProcessRequestConcurrentNoCrossContamination(t *testing.T) {
 
 	// Both requests should have their own mappings — no cross-contamination
 	// A's response should restore 203.0.113.42, not 10.0.0.5
-	respA := `{"content": "IP [TG:IP:1] is reachable"}`
+	respA := `{"content": "IP [TG:IP:1:00000000] is reachable"}`
 	processedA := router.ProcessResponse(ctxA, []byte(respA))
 	if !containsStr(string(processedA), "203.0.113.42") {
 		t.Errorf("expected ctxA to restore 203.0.113.42, got: %s", string(processedA))
 	}
 
 	// B's response should restore 10.0.0.5
-	respB := `{"content": "IP [TG:IP:1] is reachable"}`
+	respB := `{"content": "IP [TG:IP:1:00000000] is reachable"}`
 	processedB := router.ProcessResponse(ctxB, []byte(respB))
 	if !containsStr(string(processedB), "10.0.0.5") {
 		t.Errorf("expected ctxB to restore 10.0.0.5, got: %s", string(processedB))

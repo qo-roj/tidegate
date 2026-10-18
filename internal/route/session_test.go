@@ -3,6 +3,7 @@ package route
 import (
 	"encoding/json"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/qo-roj/tidegate/internal/redact"
 	"github.com/qo-roj/tidegate/internal/vault"
 )
+
+var routeTokenRe = regexp.MustCompile(`\[TG:[A-Z0-9_]+:[0-9]+:[0-9a-f]{8}\]`)
 
 func makeVaultRouter(t *testing.T) *Router {
 	t.Helper()
@@ -50,7 +53,8 @@ func TestSessionTokensStableAcrossTurns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out1), "[TG:IP:1]") {
+	tok1 := routeTokenRe.FindString(string(out1))
+	if !strings.HasPrefix(tok1, "[TG:IP:1:") {
 		t.Fatalf("turn 1 missing token: %s", out1)
 	}
 
@@ -68,18 +72,19 @@ func TestSessionTokensStableAcrossTurns(t *testing.T) {
 	msgs := decodeMessages(t, out2)
 	history := msgs[1]["content"].(string)
 	delta := msgs[3]["content"].(string)
-	if !strings.Contains(history, "[TG:IP:1]") {
-		t.Fatalf("history token changed: %q", history)
+	if !strings.Contains(history, tok1) {
+		t.Fatalf("history token changed: %q (want %s)", history, tok1)
 	}
-	if !strings.Contains(delta, "[TG:IP:2]") {
-		t.Fatalf("new value should get [TG:IP:2]: %q", delta)
+	tok2 := routeTokenRe.FindString(delta)
+	if !strings.HasPrefix(tok2, "[TG:IP:2:") {
+		t.Fatalf("new value should get [TG:IP:2:<mac>]: %q", delta)
 	}
 	// Security invariant: history must never be forwarded unredacted.
 	if strings.Contains(string(out2), "203.0.113.42") || strings.Contains(string(out2), "198.51.100.7") {
 		t.Fatalf("raw secret in forwarded body: %s", out2)
 	}
 
-	restored := router.ProcessResponse(ctx2, []byte(`{"text":"[TG:IP:1] and [TG:IP:2]"}`))
+	restored := router.ProcessResponse(ctx2, []byte(`{"text":"`+tok1+` and `+tok2+`"}`))
 	if !strings.Contains(string(restored), "203.0.113.42") || !strings.Contains(string(restored), "198.51.100.7") {
 		t.Fatalf("restore failed: %s", restored)
 	}
@@ -110,7 +115,8 @@ func TestRedactionCacheHits(t *testing.T) {
 		t.Fatalf("cached output differs:\n%s\n%s", out1, out2)
 	}
 	// A cache hit must still restore tokens in the response.
-	restored := router.ProcessResponse(ctx2, []byte("[TG:IP:1]"))
+	tok := routeTokenRe.FindString(string(out1))
+	restored := router.ProcessResponse(ctx2, []byte(tok))
 	if !strings.Contains(string(restored), "203.0.113.42") {
 		t.Fatalf("cache hit broke restore: %s", restored)
 	}
@@ -167,7 +173,7 @@ func TestNoVaultKeepsPerRequestBehaviour(t *testing.T) {
 	if ctx.Session != "" || ctx.CacheHits != 0 {
 		t.Fatalf("stateless path should have no session: %+v", ctx)
 	}
-	if got := router.ProcessResponse(ctx, []byte("[TG:IP:1]")); !strings.Contains(string(got), "203.0.113.42") {
+	if got := router.ProcessResponse(ctx, []byte("[TG:IP:1:00000000]")); !strings.Contains(string(got), "203.0.113.42") {
 		t.Fatalf("stateless restore failed: %s", got)
 	}
 }
@@ -179,4 +185,23 @@ func TestContentRouterDetectsJSON(t *testing.T) {
 		t.Fatal("JSON block not detected")
 	}
 	_ = redact.Summary{}
+}
+
+// TestJSONSecretWithTimestampRoundTrips: the vault must store the real value,
+// not a timestamp sentinel, and restore it verbatim.
+func TestJSONSecretWithTimestampRoundTrips(t *testing.T) {
+	router := makeVaultRouter(t)
+	ctx := &RequestContext{Session: "s", Redactor: router.NewRedactor().WithStore(router.Vault, "s")}
+
+	src := `{"password":"issued 2026-10-01T15:07:51Z"}`
+	out, summary := router.redactContent(ctx, ctx.Redactor, src)
+	if summary["json_secret"] != 1 {
+		t.Fatalf("summary = %v", summary)
+	}
+	if strings.ContainsRune(out, 0x7f) {
+		t.Fatalf("sentinel in output: %q", out)
+	}
+	if got := ctx.Redactor.Restore(out); got != src {
+		t.Fatalf("restore = %q, want %q", got, src)
+	}
 }

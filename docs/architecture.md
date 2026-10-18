@@ -89,7 +89,7 @@ escalated to the **highest** tier present (conservative — when in doubt, escal
 ### 3. Redactor (`internal/redact/`)
 
 - Applies regex replacements based on enabled patterns
-- Token format: `[TG:IP:1]`, `[TG:EMAIL:3]`, `[TG:TOKEN:1]` — distinctive `TG:` prefix prevents collisions
+- Token format: `[TG:IP:1:9f3c1a2b]`, `[TG:EMAIL:3:0a1b2c3d]` — distinctive `TG:` prefix prevents collisions; the trailing MAC suffix makes a token unguessable (stateless requests use `00000000`)
 - Reverse-maps tokens in response content (including SSE streams) so the agent can act on real values
 - Fuzzy matching handles reformatted tokens (quotes stripped, brackets removed)
 - With a vault attached, mappings are **session-scoped and persistent**: the same value keeps the same token across turns, and each conversation numbers independently — see [Sessions](sessions.md)

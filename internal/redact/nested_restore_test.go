@@ -8,7 +8,7 @@ import (
 // Nested-token regression: when one pattern's match embeds another token
 // (email inside a database_connection URL, redacted by the earlier-running
 // email pattern), Restore must expand the inner token too. Pre-fix, the
-// DBURL value stored "postgres://admin:[TG:EMAIL:1]@..." and restore
+// DBURL value stored "postgres://admin:[TG:EMAIL:1:00000000]@..." and restore
 // stranded the inner token. Found via dry-run --restore round-trip.
 func TestRestoreNestedTokens(t *testing.T) {
 	r := New()
@@ -18,7 +18,7 @@ func TestRestoreNestedTokens(t *testing.T) {
 	// reproducing the natural nesting.
 	in := "db: postgres://admin:SuperSecret123@db.internal.lan:5432/prod"
 	after, _ := r.Redact(in)
-	if after != "db: [TG:DBURL:1]" {
+	if after != "db: [TG:DBURL:1:00000000]" {
 		t.Fatalf("unexpected redaction: %q", after)
 	}
 
@@ -52,10 +52,10 @@ func TestRestoreLeavesUnknownTokens(t *testing.T) {
 	r := New()
 	defer r.Clear()
 
-	in := "quota [TG:IP:99] mentioned in a report"
+	in := "quota [TG:IP:99:00000000] mentioned in a report"
 	_, _ = r.Redact("server 10.1.2.3") // populate the mapping with a real token
 	restored := r.Restore(in)
-	if !strings.Contains(restored, "[TG:IP:99]") {
+	if !strings.Contains(restored, "[TG:IP:99:00000000]") {
 		t.Errorf("unknown token should strand as-is, got %q", restored)
 	}
 }

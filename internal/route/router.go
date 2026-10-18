@@ -8,8 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/qo-roj/tidegate/internal/audit"
 	"github.com/qo-roj/tidegate/internal/classify"
@@ -53,8 +51,9 @@ type Router struct {
 	// default patterns, matching pre-toggle behavior).
 	enabledPatterns []string
 
-	// rulesetFingerprint identifies the active pattern set in the
-	// redaction cache, so a config change never reuses stale output.
+	// rulesetFingerprint identifies the active pattern set (names and
+	// regexes) in the redaction cache, so a config or regex change never
+	// reuses stale output.
 	rulesetFingerprint string
 }
 
@@ -81,17 +80,8 @@ func New(rs *rules.RuleSet, ollamaClient *ollama.Client, auditLog *audit.Log) *R
 			}
 		}
 	}
-	r.rulesetFingerprint = ruleFingerprint(r.enabledPatterns)
+	r.rulesetFingerprint = "redaction-v2-" + redact.Fingerprint(r.enabledPatterns)
 	return r
-}
-
-// ruleFingerprint hashes the active rule set. Bump redactionAlgoVersion when
-// the redaction algorithm changes in a way that alters output.
-func ruleFingerprint(patterns []string) string {
-	names := append([]string{}, patterns...)
-	sort.Strings(names)
-	sum := sha256.Sum256([]byte("redaction-v2\x00" + strings.Join(names, ",")))
-	return hex.EncodeToString(sum[:8])
 }
 
 // WithVault attaches a session vault. Returns the router for chaining.
@@ -306,11 +296,12 @@ func (r *Router) ProcessRequestSession(body []byte, agent string, provider, sess
 func ApplyShapeRedaction(src string, reqRedactor *redact.Redactor) (string, redact.Summary) {
 	summary := redact.Summary{}
 
-	shielded, restore := content.ShieldTimestamps(src)
-
+	// JSON key redaction runs on the raw document so the vault stores the
+	// real value, never a timestamp sentinel.
+	work := src
 	if content.Detect(src) == content.KindJSON {
 		var n int
-		shielded, n = content.RedactJSONKeys(shielded, func(key, value string) string {
+		work, n = content.RedactJSONKeys(work, func(key, value string) string {
 			return reqRedactor.Allocate("SECRET", value)
 		})
 		if n > 0 {
@@ -318,6 +309,7 @@ func ApplyShapeRedaction(src string, reqRedactor *redact.Redactor) (string, reda
 		}
 	}
 
+	shielded, restore := content.ShieldTimestamps(work)
 	redacted, patternSummary := reqRedactor.Redact(shielded)
 	for k, v := range patternSummary {
 		summary[k] += v

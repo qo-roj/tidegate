@@ -26,7 +26,7 @@ func TestSyslogHostnameRedacts(t *testing.T) {
 	r := newTestRedactor("syslog_hostname")
 	in := "Sep  3 17:54:01 himbeerkuchen systemd[1]: Started Daily apt download.\n"
 	out, s := r.Redact(in)
-	if !strings.Contains(out, "[TG:HOST:1] systemd[1]") {
+	if !strings.Contains(out, "[TG:HOST:1:00000000] systemd[1]") {
 		t.Errorf("hostname not redacted: %q", out)
 	}
 	if !strings.Contains(out, "Sep  3 17:54:01") {
@@ -40,7 +40,7 @@ func TestSyslogHostnameRedacts(t *testing.T) {
 func TestSyslogHostnameISOTimestamp(t *testing.T) {
 	r := newTestRedactor("syslog_hostname")
 	out, _ := r.Redact("2026-09-03T17:54:03.123456+02:00 rotten-berry sshd[4242]: Failed password\n")
-	if !strings.Contains(out, "[TG:HOST:1] sshd[4242]") {
+	if !strings.Contains(out, "[TG:HOST:1:00000000] sshd[4242]") {
 		t.Errorf("ISO-format hostname not redacted: %q", out)
 	}
 }
@@ -48,10 +48,10 @@ func TestSyslogHostnameISOTimestamp(t *testing.T) {
 func TestSyslogHostnameDedup(t *testing.T) {
 	r := newTestRedactor("syslog_hostname")
 	out, s := r.Redact("Sep  3 17:54:01 host-a kernel: x\nSep  3 17:54:02 host-a kernel: y\nSep  3 17:54:03 host-b kernel: z\n")
-	if got := strings.Count(out, "[TG:HOST:1]"); got != 2 {
+	if got := strings.Count(out, "[TG:HOST:1:00000000]"); got != 2 {
 		t.Errorf("same hostname should reuse token, got %d HOST:1 in %q", got, out)
 	}
-	if !strings.Contains(out, "[TG:HOST:2]") || strings.Count(out, "[TG:HOST:2]") != 1 {
+	if !strings.Contains(out, "[TG:HOST:2:00000000]") || strings.Count(out, "[TG:HOST:2:00000000]") != 1 {
 		t.Errorf("second hostname should get HOST:2, got %q", out)
 	}
 	if s["syslog_hostname"] != 3 {
@@ -67,7 +67,7 @@ func TestAccesslogHostnameRedacts(t *testing.T) {
 	r := newTestRedactor("accesslog_hostname")
 	in := `myhost.com:443 203.0.113.7 - - [01/Oct/2026:14:44:22 +0200] "GET /en/?id=147&view=category HTTP/1.1" 404 32445 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0"` + "\n"
 	out, s := r.Redact(in)
-	if !strings.HasPrefix(out, "[TG:HOST:1]:443 203.0.113.7 - - [01/Oct/2026:14:44:22 +0200]") {
+	if !strings.HasPrefix(out, "[TG:HOST:1:00000000]:443 203.0.113.7 - - [01/Oct/2026:14:44:22 +0200]") {
 		t.Errorf("vhost not redacted with structure intact: %q", out)
 	}
 	if strings.Contains(out, "myhost.com") {
@@ -83,9 +83,9 @@ func TestAccesslogHostnameRedacts(t *testing.T) {
 // field and not re-tokenize the IP token.
 func TestAccesslogHostnameAfterIPRedaction(t *testing.T) {
 	r := newTestRedactor("accesslog_hostname")
-	in := `myhost.com:443 [TG:IP:1] - - [01/Oct/2026:14:44:22 +0200] "GET / HTTP/1.1" 404 32445 "-" "Mozilla/5.0"` + "\n"
+	in := `myhost.com:443 [TG:IP:1:00000000] - - [01/Oct/2026:14:44:22 +0200] "GET / HTTP/1.1" 404 32445 "-" "Mozilla/5.0"` + "\n"
 	out, _ := r.Redact(in)
-	if !strings.HasPrefix(out, "[TG:HOST:1]:443 [TG:IP:1] - - [01/Oct/2026:14:44:22 +0200]") {
+	if !strings.HasPrefix(out, "[TG:HOST:1:00000000]:443 [TG:IP:1:00000000] - - [01/Oct/2026:14:44:22 +0200]") {
 		t.Errorf("unexpected output: %q", out)
 	}
 	restored := r.Restore(out)
@@ -101,13 +101,13 @@ func TestAccesslogHostnameVariants(t *testing.T) {
 		want string
 	}{
 		{"no port", "api.example.org 192.168.1.5 - - [30/Sep/2026:23:59:59 +0000] \"POST /login HTTP/2.0\" 401 87 \"-\" \"-\"",
-			"[TG:HOST:1] 192.168.1.5 - - [30/Sep/2026:23:59:59 +0000]"},
-		{"rfc3339", "cdn.mycorp.internal:8443 [TG:IP:2] - - [2026-09-30T23:59:59Z] \"GET / HTTP/1.1\" 200 10 \"-\" \"-\"",
-			"[TG:HOST:1]:8443 [TG:IP:2] - - [2026-09-30T23:59:59Z]"},
+			"[TG:HOST:1:00000000] 192.168.1.5 - - [30/Sep/2026:23:59:59 +0000]"},
+		{"rfc3339", "cdn.mycorp.internal:8443 [TG:IP:2:00000000] - - [2026-09-30T23:59:59Z] \"GET / HTTP/1.1\" 200 10 \"-\" \"-\"",
+			"[TG:HOST:1:00000000]:8443 [TG:IP:2:00000000] - - [2026-09-30T23:59:59Z]"},
 		{"dash client", "shop.example.net:443 - - - [01/Oct/2026:00:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"",
-			"[TG:HOST:1]:443 - - - [01/Oct/2026:00:00:00 +0000]"},
+			"[TG:HOST:1:00000000]:443 - - - [01/Oct/2026:00:00:00 +0000]"},
 		{"ip vhost", "10.0.0.5:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"",
-			"[TG:HOST:1]:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200]"},
+			"[TG:HOST:1:00000000]:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200]"},
 	}
 	for _, tc := range cases {
 		// Fresh redactor per case: counters accumulate across Redact calls
@@ -149,10 +149,10 @@ func TestAccesslogHostnameDedup(t *testing.T) {
 	out, s := r.Redact("a.example.com:443 1.2.3.4 - - [01/Oct/2026:10:00:00 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n" +
 		"a.example.com:443 1.2.3.4 - - [01/Oct/2026:10:00:01 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n" +
 		"b.example.com:443 1.2.3.4 - - [01/Oct/2026:10:00:02 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n")
-	if got := strings.Count(out, "[TG:HOST:1]"); got != 2 {
+	if got := strings.Count(out, "[TG:HOST:1:00000000]"); got != 2 {
 		t.Errorf("same vhost should reuse token, got %d HOST:1 in %q", got, out)
 	}
-	if strings.Count(out, "[TG:HOST:2]") != 1 {
+	if strings.Count(out, "[TG:HOST:2:00000000]") != 1 {
 		t.Errorf("second vhost should get HOST:2, got %q", out)
 	}
 	if s["accesslog_hostname"] != 3 {
@@ -165,7 +165,7 @@ func TestAccesslogHostnameDedup(t *testing.T) {
 func TestAccesslogHostnameIPVhostAttribution(t *testing.T) {
 	r := newTestRedactor("ipv4", "accesslog_hostname")
 	out, s := r.Redact("10.0.0.5:443 203.0.113.9 - - [01/Oct/2026:14:44:22 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"-\"\n")
-	if !strings.Contains(out, "[TG:IP:1]:443 [TG:IP:2] - - ") {
+	if !strings.Contains(out, "[TG:IP:1:00000000]:443 [TG:IP:2:00000000] - - ") {
 		t.Errorf("IP vhost not attributed to IP pattern: %q", out)
 	}
 	if strings.Contains(out, "[TG:HOST:") {
@@ -184,7 +184,7 @@ func TestDocrootHostnameRedacts(t *testing.T) {
 	r := newTestRedactor("docroot_hostname")
 	in := "[Thu Oct 01 15:07:51.712345 2026] [access_compat:error] [pid 2283163:tid 2283163] [client 203.0.113.9:60650] AH01797: client denied by server configuration: /var/www/myhost.com/htdocs/e424591d45b4.php\n"
 	out, s := r.Redact(in)
-	if !strings.Contains(out, "/var/www/[TG:HOST:1]/htdocs/e424591d45b4.php") {
+	if !strings.Contains(out, "/var/www/[TG:HOST:1:00000000]/htdocs/e424591d45b4.php") {
 		t.Errorf("docroot hostname not redacted: %q", out)
 	}
 	if strings.Contains(out, "myhost.com") {
@@ -209,11 +209,11 @@ func TestDocrootHostnameVariants(t *testing.T) {
 		want string
 	}{
 		{"plesk vhosts", "failed to open /var/www/vhosts/myhost.com/httpdocs/index.php",
-			"/var/www/vhosts/[TG:HOST:1]/httpdocs/index.php"},
+			"/var/www/vhosts/[TG:HOST:1:00000000]/httpdocs/index.php"},
 		{"srv www", "cannot read /srv/www/shop.example.net/htdocs/logo.png",
-			"/srv/www/[TG:HOST:1]/htdocs/logo.png"},
+			"/srv/www/[TG:HOST:1:00000000]/htdocs/logo.png"},
 		{"subdomain", "open() /var/www/api.mycorp.de/htdocs/health failed",
-			"/var/www/[TG:HOST:1]/htdocs/health failed"},
+			"/var/www/[TG:HOST:1:00000000]/htdocs/health failed"},
 	}
 	for _, tc := range cases {
 		r := newTestRedactor("docroot_hostname")
@@ -248,7 +248,7 @@ func TestURLHostnameRedacts(t *testing.T) {
 	r := newTestRedactor("url_hostname")
 	in := `203.0.113.7 - - [01/Oct/2026:14:44:22 +0200] "GET /en/ HTTP/1.1" 200 512 "https://myhost.com/en/?ref=x" "Mozilla/5.0"` + "\n"
 	out, s := r.Redact(in)
-	if !strings.Contains(out, "\"https://[TG:HOST:1]/en/?ref=x\"") {
+	if !strings.Contains(out, "\"https://[TG:HOST:1:00000000]/en/?ref=x\"") {
 		t.Errorf("URL host not redacted: %q", out)
 	}
 	if s["url_hostname"] != 1 {
@@ -267,13 +267,13 @@ func TestURLHostnameVariants(t *testing.T) {
 		want string
 	}{
 		{"port survives", "curl -s https://api.mycorp.internal:8443/health",
-			"curl -s https://[TG:HOST:1]:8443/health"},
+			"curl -s https://[TG:HOST:1:00000000]:8443/health"},
 		{"http scheme", "fetch http://cdn.example.net/js/app.js now",
-			"fetch http://[TG:HOST:1]/js/app.js now"},
+			"fetch http://[TG:HOST:1:00000000]/js/app.js now"},
 		{"userinfo stays out of group", "clone https://user@bitbucket.example.org/repo.git",
-			"clone https://user@[TG:HOST:1]/repo.git"},
+			"clone https://user@[TG:HOST:1:00000000]/repo.git"},
 		{"ftp scheme", "get ftp://files.example.com/pub/data.tar.gz",
-			"get ftp://[TG:HOST:1]/pub/data.tar.gz"},
+			"get ftp://[TG:HOST:1:00000000]/pub/data.tar.gz"},
 	}
 	for _, tc := range cases {
 		r := newTestRedactor("url_hostname")
@@ -331,7 +331,7 @@ func TestPhoneDoesNotEatTimestamps(t *testing.T) {
 	} {
 		r := newTestRedactor("phone")
 		out, s := r.Redact(in + "\n")
-		if !strings.Contains(out, "[TG:PHONE:1]") || s["phone"] != 1 {
+		if !strings.Contains(out, "[TG:PHONE:1:00000000]") || s["phone"] != 1 {
 			t.Errorf("phone form lost: %q -> %q (%v)", in, out, s)
 		}
 	}
@@ -383,7 +383,7 @@ func TestSyslogHostnameKernelAndTaglessProcess(t *testing.T) {
 	for _, c := range cases {
 		r := newTestRedactor("syslog_hostname") // fresh: each case expects HOST:1
 		out, s := r.Redact(c)
-		if !strings.Contains(out, "[TG:HOST:1]") {
+		if !strings.Contains(out, "[TG:HOST:1:00000000]") {
 			t.Errorf("real syslog line not redacted: %q → %q", c, out)
 		}
 		if s["syslog_hostname"] != 1 {
@@ -396,10 +396,10 @@ func TestPasswdUsernameRedacts(t *testing.T) {
 	r := newTestRedactor("passwd_username")
 	in := "root:x:0:0:root:/root:/bin/bash\nsid:x:1000:1000:Sid Crab:/home/sid:/usr/bin/fish\n"
 	out, s := r.Redact(in)
-	if !strings.HasPrefix(out, "[TG:USER:1]:x:0:0:") {
+	if !strings.HasPrefix(out, "[TG:USER:1:00000000]:x:0:0:") {
 		t.Errorf("first username not redacted: %q", out)
 	}
-	if !strings.Contains(out, "[TG:USER:2]:x:1000:1000:Sid Crab:/home/sid") {
+	if !strings.Contains(out, "[TG:USER:2:00000000]:x:1000:1000:Sid Crab:/home/sid") {
 		t.Errorf("second username not redacted: %q", out)
 	}
 	if s["passwd_username"] != 2 {
@@ -505,7 +505,7 @@ func TestPhoneCoversNANPForm(t *testing.T) {
 	for _, c := range cases {
 		r := newTestRedactor("phone") // fresh: each case expects PHONE:1
 		out, s := r.Redact(c)
-		if !strings.Contains(out, "[TG:PHONE:1]") {
+		if !strings.Contains(out, "[TG:PHONE:1:00000000]") {
 			t.Errorf("phone not redacted: %q → %q", c, out)
 		}
 		if s["phone"] != 1 {
@@ -526,7 +526,7 @@ func TestPhoneCoversNANPForm(t *testing.T) {
 			t.Errorf("false positive: %q → %q (%v)", c, out, s)
 		}
 	}
-	if out, _ := r.Redact("order 1234567890 done"); !strings.Contains(out, "[TG:PHONE:1]") {
+	if out, _ := r.Redact("order 1234567890 done"); !strings.Contains(out, "[TG:PHONE:1:00000000]") {
 		t.Errorf("bare 10-digit should match NANP shape (documented trade-off): %q", out)
 	}
 }

@@ -184,7 +184,7 @@ func TestProxyRestoresTokensInResponse(t *testing.T) {
 	}), "openai")
 
 	// Upstream response echoes the token back
-	upstream.responseBody = `{"content": "The IP [TG:IP:1] is reachable"}`
+	upstream.responseBody = `{"content": "The IP [TG:IP:1:00000000] is reachable"}`
 
 	rec := httptest.NewRecorder()
 	srv.handleProxy(rec, req)
@@ -366,7 +366,7 @@ func TestProxyStreamingResponseRestoresTokens(t *testing.T) {
 	}), "openai")
 
 	// Upstream returns SSE with the token split across chunks
-	upstream.responseBody = "data: {\"content\": \"IP [TG:IP:1]\"}\n\ndata: [DONE]\n\n"
+	upstream.responseBody = "data: {\"content\": \"IP [TG:IP:1:00000000]\"}\n\ndata: [DONE]\n\n"
 	upstream.statusCode = 200
 
 	// Override upstream handler to return SSE
@@ -382,7 +382,7 @@ func TestProxyStreamingResponseRestoresTokens(t *testing.T) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		w.Write([]byte(":1] is reachable\"}\n\ndata: [DONE]\n\n"))
+		w.Write([]byte(":1:00000000] is reachable\"}\n\ndata: [DONE]\n\n"))
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -404,12 +404,12 @@ func TestProxyStreamingResponseRestoresTokens(t *testing.T) {
 func TestProxyConcurrentRequestsNoCrossContamination(t *testing.T) {
 	srv, upstream := makeTestServer(t)
 
-	// Use a stateless upstream handler that returns [TG:IP:1] for each request.
+	// Use a stateless upstream handler that returns [TG:IP:1:00000000] for each request.
 	// Don't write to shared upstream fields to avoid data races.
 	upstream.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		w.Write([]byte(`{"content": "response with [TG:IP:1]"}`))
+		w.Write([]byte(`{"content": "response with [TG:IP:1:00000000]"}`))
 	})
 
 	// Send two concurrent requests with different IPs
