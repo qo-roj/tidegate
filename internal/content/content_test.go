@@ -73,6 +73,36 @@ func TestRedactJSONKeysEscapedValue(t *testing.T) {
 	}
 }
 
+func TestRedactJSONKeysEscapingRoundTrip(t *testing.T) {
+	cases := []string{
+		`{"password":"line\nbreak","x":1}`,
+		`{"password":"quote\"inside","x":1}`,
+		`{"password":"back\\slash","x":1}`,
+		`{"password":"caf\u00e9","x":1}`,
+		`{"password":"emoji \ud83d\ude00","x":1}`,
+	}
+	for _, src := range cases {
+		var stored string
+		out, n := content.RedactJSONKeys(src, func(key, value string) string {
+			stored = value
+			return "[TG:SECRET:1]"
+		})
+		if n != 1 {
+			t.Errorf("%s: replaced %d", src, n)
+			continue
+		}
+		if !json.Valid([]byte(out)) {
+			t.Errorf("%s: invalid output %s", src, out)
+		}
+		// The stored original must be the decoded value, and re-encoding it
+		// must reproduce a valid document.
+		reencoded, err := json.Marshal(map[string]string{"password": stored})
+		if err != nil || !json.Valid(reencoded) {
+			t.Errorf("%s: stored %q does not round-trip: %v", src, stored, err)
+		}
+	}
+}
+
 func TestRedactJSONKeysSkipsTokensAndEmpty(t *testing.T) {
 	src := `{"token":"[TG:SECRET:1]","secret":"","password":null}`
 	out, n := content.RedactJSONKeys(src, func(key, value string) string { return "[TG:SECRET:9]" })

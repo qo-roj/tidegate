@@ -113,6 +113,12 @@ func (v *Vault) migrate() error {
 			seq      INTEGER NOT NULL,
 			PRIMARY KEY (session, category)
 		)`,
+		`CREATE TABLE IF NOT EXISTS session_owners (
+			id       TEXT PRIMARY KEY,
+			identity TEXT NOT NULL,
+			updated  INTEGER NOT NULL,
+			expires  INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS redaction_cache (
 			session  TEXT NOT NULL,
 			ruleset  TEXT NOT NULL,
@@ -268,20 +274,69 @@ func (v *Vault) Tokens(session string) (map[string]string, error) {
 	return out, rows.Err()
 }
 
-// SessionsForTokens returns the distinct sessions that own any of the given
-// tokens. Used to follow a conversation's lineage when the client does not
-// send an explicit session header.
-func (v *Vault) SessionsForTokens(tokens []string) ([]string, error) {
+// ClaimSession records that identity owns session. Sessions are only
+// adoptable — and tokens only resolvable — by the identity that created them.
+func (v *Vault) ClaimSession(session, identity string) error {
+	if session == "" {
+		return nil
+	}
+	if identity == "" {
+		identity = "local"
+	}
+	now := v.now()
+	_, err := v.db.Exec(
+		`INSERT INTO session_owners (id, identity, updated, expires) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET identity = excluded.identity,
+		 updated = excluded.updated, expires = excluded.expires`,
+		session, identity, now.Unix(), now.Add(v.ttl*7).Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("vault session claim: %w", err)
+	}
+	return nil
+}
+
+// SessionOwnedBy reports whether identity owns session.
+func (v *Vault) SessionOwnedBy(session, identity string) bool {
+	if session == "" {
+		return false
+	}
+	if identity == "" {
+		identity = "local"
+	}
+	var owner string
+	var expires int64
+	err := v.db.QueryRow(
+		`SELECT identity, expires FROM session_owners WHERE id = ?`, session,
+	).Scan(&owner, &expires)
+	if err != nil || expires < v.now().Unix() {
+		return false
+	}
+	return owner == identity
+}
+
+// SessionsForTokensOwnedBy returns the sessions that own any of the given
+// tokens AND belong to identity. Tokens are guessable labels, so ownership is
+// the only thing that makes adoption safe.
+func (v *Vault) SessionsForTokensOwnedBy(tokens []string, identity string) ([]string, error) {
 	if len(tokens) == 0 {
 		return nil, nil
 	}
+	if identity == "" {
+		identity = "local"
+	}
 	placeholders := make([]string, len(tokens))
-	args := make([]interface{}, len(tokens))
+	args := make([]interface{}, 0, len(tokens)+2)
 	for i, t := range tokens {
 		placeholders[i] = "?"
-		args[i] = t
+		args = append(args, t)
 	}
-	q := `SELECT DISTINCT session FROM tokens WHERE token IN (` + strings.Join(placeholders, ",") + `)`
+	args = append(args, identity, v.now().Unix())
+	q := `SELECT DISTINCT t.session FROM tokens t
+	      JOIN session_owners o ON o.id = t.session
+	      WHERE t.token IN (` + strings.Join(placeholders, ",") + `)
+	        AND o.identity = ? AND o.expires >= ? AND t.expires >= ?`
+	args = append(args, v.now().Unix())
 	rows, err := v.db.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("vault session lookup: %w", err)
@@ -305,6 +360,7 @@ func (v *Vault) Sweep() (int64, error) {
 	for _, q := range []string{
 		`DELETE FROM tokens WHERE expires < ?`,
 		`DELETE FROM redaction_cache WHERE expires < ?`,
+		`DELETE FROM session_owners WHERE expires < ?`,
 	} {
 		res, err := v.db.Exec(q, now)
 		if err != nil {
@@ -392,19 +448,25 @@ func TokensIn(content string) []string {
 	return out
 }
 
-// DeriveSession determines the session id for a request:
+// DeriveSession determines the session id for a request.
 //
-//  1. An explicit X-Tidegate-Session header wins (hashed, so the header value
-//     itself is not persisted).
-//  2. Otherwise, if the request carries tokens owned by exactly one known
-//     session, that session is adopted — the conversation identifies itself.
-//  3. Otherwise, a fingerprint of the stable conversation prefix (agent +
-//     first system message + first user message) is used.
-//  4. Stateless requests (no messages) get "" and fall back to per-request
-//     mappings.
-func DeriveSession(header, agent string, body []byte, v *Vault) string {
+// identity must be the authenticated principal (gateway client-key name, or
+// "local" in single-machine mode) — never a spoofable header value. Tokens are
+// readable labels like [TG:IP:1], so a token must not function as a bearer
+// capability: adoption and restore are both bound to the identity that
+// created the session.
+//
+// Order:
+//  1. X-Tidegate-Session header, hashed together with the identity.
+//  2. Tokens in the request owned by exactly one session of this identity.
+//  3. Fingerprint of the conversation opening (identity + system + first user).
+//  4. "" for stateless requests (per-request mappings).
+func DeriveSession(header, identity string, body []byte, v *Vault) string {
+	if identity == "" {
+		identity = "local"
+	}
 	if h := strings.TrimSpace(header); h != "" {
-		sum := sha256.Sum256([]byte(h))
+		sum := sha256.Sum256([]byte(identity + "\x00" + h))
 		return "h:" + hex.EncodeToString(sum[:8])
 	}
 
@@ -413,7 +475,7 @@ func DeriveSession(header, agent string, body []byte, v *Vault) string {
 		if len(rawTokens) > 16 {
 			rawTokens = rawTokens[:16]
 		}
-		if sessions, err := v.SessionsForTokens(rawTokens); err == nil && len(sessions) == 1 {
+		if sessions, err := v.SessionsForTokensOwnedBy(rawTokens, identity); err == nil && len(sessions) == 1 {
 			return sessions[0]
 		}
 	}
@@ -422,8 +484,18 @@ func DeriveSession(header, agent string, body []byte, v *Vault) string {
 	if prefix == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(agent + "\x00" + prefix))
+	sum := sha256.Sum256([]byte(identity + "\x00" + prefix))
 	return "f:" + hex.EncodeToString(sum[:8])
+}
+
+// DeriveAndClaim derives the session and records identity ownership. Use this
+// from request paths; DeriveSession is the pure variant for tests.
+func DeriveAndClaim(header, identity string, body []byte, v *Vault) string {
+	session := DeriveSession(header, identity, body, v)
+	if v != nil && session != "" {
+		_ = v.ClaimSession(session, identity)
+	}
+	return session
 }
 
 // conversationPrefix extracts the stable opening of a conversation: the first

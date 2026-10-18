@@ -748,6 +748,20 @@ Instead the cost is reduced with a **content-addressed redaction cache**:
 equivalent to recomputation by construction. This keeps history byte-identical
 across turns, which is also what provider prompt caches want.
 
+### Security Finding: Tokens Are Guessable
+
+The first implementation adopted a session whenever a request carried tokens
+owned by exactly one session. Since `[TG:IP:1]` is predictable, a guessed token
+became a bearer capability: a different gateway client could echo it, be
+adopted, and receive the original in the response (Sid, review round
+2026-10-18 — confirmed as cross-principal disclosure).
+
+Fix: sessions are owned by the authenticated identity (`client:<key-name>` in
+gateway mode, `local` otherwise), never by the spoofable `X-Tidegate-Agent`
+header. Adoption queries are filtered by ownership, and the session-header hash
+includes the identity, so two clients using the same header value get different
+sessions. Regression tests cover vault and proxy paths.
+
 ### Trade-offs
 
 - The vault holds plaintext originals at rest (`0600`, 24h TTL). Necessary for

@@ -143,3 +143,52 @@ func TestProxyMetrics(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayClientCannotAdoptAnotherClientsSession is the regression test for
+// the session oracle: tokens are guessable, so ownership must be bound to the
+// authenticated client key.
+func TestGatewayClientCannotAdoptAnotherClientsSession(t *testing.T) {
+	srv, upstream := makeTestServer(t)
+	v, err := vault.Open(filepath.Join(t.TempDir(), "vault.db"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	srv.Vault = v
+	srv.Clients = []Client{
+		{Name: "alice", Key: "key-a"},
+		{Name: "bob", Key: "key-b"},
+	}
+
+	aliceBody := makeChatBody(t, []map[string]interface{}{
+		{"role": "user", "content": "log /var/log/app.log host 203.0.113.42"},
+	})
+	req := makeChatRequest(t, aliceBody, "openai")
+	req.Header.Set("X-Tidegate-Key", "key-a")
+	req.Header.Set("X-Tidegate-Session", "shared-name")
+	rec := httptest.NewRecorder()
+	srv.handleProxy(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("alice status %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(string(upstream.receivedBody), "[TG:IP:1]") {
+		t.Fatalf("alice body: %s", upstream.receivedBody)
+	}
+
+	// Bob guesses the token and even reuses the session header name.
+	upstream.responseBody = `{"text":"the host is [TG:IP:1]"}`
+	bobBody := makeChatBody(t, []map[string]interface{}{
+		{"role": "user", "content": "what is [TG:IP:1]?"},
+	})
+	req = makeChatRequest(t, bobBody, "openai")
+	req.Header.Set("X-Tidegate-Key", "key-b")
+	req.Header.Set("X-Tidegate-Session", "shared-name")
+	rec = httptest.NewRecorder()
+	srv.handleProxy(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("bob status %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "203.0.113.42") {
+		t.Fatalf("bob harvested alice's value: %s", rec.Body.String())
+	}
+}

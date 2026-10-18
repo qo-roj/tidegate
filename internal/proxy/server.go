@@ -197,6 +197,11 @@ func (s *Server) listenAddr() string {
 
 // handleProxy is the main request handler.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	// identity is the authenticated principal. Session ownership and token
+	// restore are bound to it — never to the spoofable X-Tidegate-Agent
+	// header. In single-machine mode every request is the same principal.
+	identity := "local"
+
 	// Gateway mode: authenticate the client via pre-shared key. The key
 	// header is stripped below, so it never reaches the upstream API.
 	// RequireKey (lockdown) trips the gate even with zero clients.
@@ -210,6 +215,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// The authenticated client identity is authoritative: it cannot
 		// be spoofed via the X-Tidegate-Agent header.
 		r.Header.Set("X-Tidegate-Agent", clientName)
+		identity = "client:" + clientName
 	}
 
 	// Identify the agent — check custom header first, then fall back to
@@ -257,7 +263,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Session identity: explicit header, else inferred from the
 	// conversation's own tokens, else a fingerprint of its opening.
-	session := vault.DeriveSession(r.Header.Get(SessionHeader), agent, body, s.Vault)
+	session := vault.DeriveAndClaim(r.Header.Get(SessionHeader), identity, body, s.Vault)
 
 	// Process the request through the router (classify, redact, route)
 	ctx, modifiedBody, blocked, err := s.Router.ProcessRequestSession(body, agent, provider, session)

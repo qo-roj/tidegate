@@ -34,18 +34,48 @@ requests cannot hand out the same number twice.
 
 ## How a session is identified
 
-1. **`X-Tidegate-Session` header** — explicit, hashed before storage. Use this
-   when the client can set headers (gateway mode, custom wrappers).
+1. **`X-Tidegate-Session` header** — explicit, hashed together with the
+   caller's identity. Use this when the client can set headers.
 2. **Token ownership** — if the request carries tokens that belong to exactly
-   one known session, that session is adopted. Conversations identify
-   themselves; no header needed.
-3. **Opening fingerprint** — otherwise the first system message plus the first
-   user message (and the agent name) are hashed. Both stay byte-identical as
-   the conversation grows, so the id is stable.
+   one session *owned by this identity*, that session is adopted. Conversations
+   identify themselves; no header needed.
+3. **Opening fingerprint** — otherwise identity + first system message + first
+   user message are hashed. Both messages stay byte-identical as the
+   conversation grows, so the id is stable.
 4. **Stateless** — requests with no messages get no session and fall back to
    the old per-request behaviour.
 
 The header is stripped before forwarding and never reaches a provider.
+
+### Identity, not agent label
+
+Session ownership is bound to the authenticated principal:
+
+- **Gateway mode** — the client-key name (`client:alice`), resolved by constant
+  time comparison before any session work.
+- **Single-machine mode** — `local`.
+
+`X-Tidegate-Agent` and `User-Agent` are never used for this. They are
+spoofable labels for rules and audit only.
+
+### Tokens are not bearer capabilities
+
+Tokens look like `[TG:IP:1]` — deliberately readable, and therefore guessable.
+Early v0.7.0 builds adopted a session when a request carried tokens owned by
+exactly one known session. That made a guessed token a bearer credential: any
+key-holding gateway client could echo `[TG:IP:1]`, be adopted, and receive the
+original in the restored response (cross-principal disclosure).
+
+Fixed before release: adoption and restore are bound to session ownership, and
+a session id is derived per identity (the same `X-Tidegate-Session` value from
+two clients produces two sessions). A foreign or guessed token now stays
+opaque. Regression tests: `TestAdoptionRequiresSameIdentity`,
+`TestHeaderIsIdentityBound`, `TestGatewayClientCannotAdoptAnotherClientsSession`.
+
+Binding identity is sufficient because the remaining local case — one user's
+agents sharing a machine — is one principal: those agents can already read the
+same files. Unguessable tokens would add defence in depth but change the token
+format; it is not required while possession alone never authorises access.
 
 ## Reverse mapping is scoped
 

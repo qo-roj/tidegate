@@ -87,21 +87,44 @@ func TestTokenExpiry(t *testing.T) {
 	}
 }
 
-func TestSessionsForTokens(t *testing.T) {
+func TestSessionsForTokensOwnedBy(t *testing.T) {
 	v := newTestVault(t, time.Hour)
 	v.Token("s1", "IP", "203.0.113.42")
 	v.Token("s2", "EMAIL", "a@b.c")
+	v.ClaimSession("s1", "alice")
+	v.ClaimSession("s2", "bob")
 
-	got, err := v.SessionsForTokens([]string{"[TG:IP:1]", "[TG:EMAIL:1]"})
+	got, err := v.SessionsForTokensOwnedBy([]string{"[TG:IP:1]", "[TG:EMAIL:1]"}, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("want 2 sessions, got %v", got)
-	}
-	got, _ = v.SessionsForTokens([]string{"[TG:IP:1]"})
 	if len(got) != 1 || got[0] != "s1" {
-		t.Fatalf("want [s1], got %v", got)
+		t.Fatalf("alice should only see s1, got %v", got)
+	}
+	got, _ = v.SessionsForTokensOwnedBy([]string{"[TG:IP:1]"}, "mallory")
+	if len(got) != 0 {
+		t.Fatalf("mallory must not adopt s1, got %v", got)
+	}
+}
+
+func TestSessionOwnership(t *testing.T) {
+	v := newTestVault(t, time.Hour)
+	if err := v.ClaimSession("s1", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if !v.SessionOwnedBy("s1", "alice") {
+		t.Fatal("alice should own s1")
+	}
+	if v.SessionOwnedBy("s1", "bob") {
+		t.Fatal("bob must not own s1")
+	}
+	if v.SessionOwnedBy("unknown", "alice") {
+		t.Fatal("unknown session should not be owned")
+	}
+	// Re-claiming transfers ownership (same id, new identity).
+	v.ClaimSession("s1", "bob")
+	if v.SessionOwnedBy("s1", "alice") || !v.SessionOwnedBy("s1", "bob") {
+		t.Fatal("claim should have transferred ownership")
 	}
 }
 
@@ -110,14 +133,18 @@ func TestDeriveSessionHeaderWins(t *testing.T) {
 	if got := DeriveSession("abc", "claude", []byte(`{"messages":[]}`), v); got == "" || got[:2] != "h:" {
 		t.Fatalf("header session = %q", got)
 	}
-	// Same header → same id; different header → different id.
+	// Same header + same identity → same id; either changing → new id.
 	a := DeriveSession("abc", "claude", nil, v)
-	b := DeriveSession("abc", "codex", nil, v)
-	c := DeriveSession("xyz", "claude", nil, v)
+	b := DeriveSession("abc", "claude", nil, v)
+	c := DeriveSession("abc", "codex", nil, v)
+	d := DeriveSession("xyz", "claude", nil, v)
 	if a != b {
-		t.Fatal("header id should not depend on agent")
+		t.Fatal("same header and identity must be stable")
 	}
 	if a == c {
+		t.Fatal("the same header must not be shared across identities")
+	}
+	if a == d {
 		t.Fatal("different headers must produce different ids")
 	}
 }
@@ -125,6 +152,7 @@ func TestDeriveSessionHeaderWins(t *testing.T) {
 func TestDeriveSessionAdoptsTokenOwner(t *testing.T) {
 	v := newTestVault(t, time.Hour)
 	v.Token("h:deadbeefdeadbeef", "IP", "203.0.113.42")
+	v.ClaimSession("h:deadbeefdeadbeef", "claude")
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"messages": []interface{}{
@@ -135,6 +163,41 @@ func TestDeriveSessionAdoptsTokenOwner(t *testing.T) {
 	got := DeriveSession("", "claude", body, v)
 	if got != "h:deadbeefdeadbeef" {
 		t.Fatalf("want adopted session, got %q", got)
+	}
+}
+
+// TestAdoptionRequiresSameIdentity is the regression test for the session
+// oracle: guessing [TG:IP:1] must not let another principal adopt a session
+// and harvest the original.
+func TestAdoptionRequiresSameIdentity(t *testing.T) {
+	v := newTestVault(t, time.Hour)
+	v.Token("h:victim", "IP", "203.0.113.42")
+	v.ClaimSession("h:victim", "client:alice")
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "echo [TG:IP:1]"},
+		},
+	})
+
+	if got := DeriveSession("", "client:alice", body, v); got != "h:victim" {
+		t.Fatalf("owner should adopt, got %q", got)
+	}
+	got := DeriveSession("", "client:mallory", body, v)
+	if got == "h:victim" {
+		t.Fatal("different identity adopted the victim session")
+	}
+	if got == "" || got[:2] != "f:" {
+		t.Fatalf("attacker should fall back to its own fingerprint, got %q", got)
+	}
+}
+
+func TestHeaderIsIdentityBound(t *testing.T) {
+	v := newTestVault(t, time.Hour)
+	a := DeriveSession("same-header", "client:alice", nil, v)
+	b := DeriveSession("same-header", "client:bob", nil, v)
+	if a == b {
+		t.Fatal("the same header must not produce one session across identities")
 	}
 }
 

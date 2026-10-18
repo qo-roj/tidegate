@@ -18,7 +18,6 @@ package content
 import (
 	"encoding/json"
 	"regexp"
-	"strconv"
 	"strings"
 )
 
@@ -150,15 +149,14 @@ func RedactJSONKeys(src string, fn func(key, value string) string) (string, int)
 		if keyStart < 0 || keyEnd < 0 || valueStart < 0 || valueEnd < 0 {
 			continue
 		}
-		key, err := strconv.Unquote(`"` + src[keyStart:keyEnd] + `"`)
+		key, err := unquoteJSON(src[keyStart:keyEnd])
 		if err != nil {
 			continue
 		}
 		if !IsSensitiveKey(key) {
 			continue
 		}
-		rawValue := src[valueStart:valueEnd]
-		value, err := strconv.Unquote(`"` + rawValue + `"`)
+		value, err := unquoteJSON(src[valueStart:valueEnd])
 		if err != nil {
 			continue
 		}
@@ -181,6 +179,18 @@ func RedactJSONKeys(src string, fn func(key, value string) string) (string, int)
 		return out, count
 	}
 	return src, 0
+}
+
+// unquoteJSON decodes a JSON string body (without the surrounding quotes).
+// encoding/json handles \uXXXX escapes and surrogate pairs, which
+// strconv.Unquote rejects — a password value containing an escaped emoji must
+// still be redacted.
+func unquoteJSON(raw string) (string, error) {
+	var out string
+	if err := json.Unmarshal([]byte(`"`+raw+`"`), &out); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // ShieldTimestamps temporarily replaces timestamp spans with inert sentinels
