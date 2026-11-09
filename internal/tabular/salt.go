@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -48,26 +50,47 @@ func ParseMode(s string) Mode {
 	}
 }
 
+// tabPolicyVersion invalidates cached output when the transform itself changes
+// semantics, independent of any config value.
+const tabPolicyVersion = "tab-v1"
+
 // Fingerprint identifies the effective generalization policy: salt, thresholds
 // and column policy. The redaction cache keys on it, so changing any of these
 // must not serve output produced under the old settings.
 func (o Options) Fingerprint() string {
 	o = o.withDefaults()
-	parts := []string{
-		"salt:" + sumHex(o.Salt),
-		fmt.Sprintf("min:%d", o.MinRows),
-		fmt.Sprintf("sig:%d", o.SigFigs),
-		fmt.Sprintf("cat:%d", o.MaxCategorical),
-		"text:" + o.Text,
-		"keep:" + strings.Join(o.Keep, "|"),
-		"drop:" + strings.Join(o.Drop, "|"),
-	}
-	for _, k := range []string{"email", "ip", "phone", "card", "ssn", "uuid", "url", "date", "number", "text"} {
-		if o.Disable[k] {
-			parts = append(parts, "off:"+k)
+	disabled := make([]string, 0, len(o.Disable))
+	for name, off := range o.Disable {
+		if off {
+			disabled = append(disabled, name)
 		}
 	}
-	return sumHex(strings.Join(parts, "\x00"))[:16]
+	sort.Strings(disabled)
+
+	// JSON rather than a joined string: a regex containing the separator can
+	// no longer alias another policy's fingerprint.
+	raw, _ := json.Marshal(struct {
+		Version string   `json:"v"`
+		Salt    string   `json:"salt"`
+		Min     int      `json:"min"`
+		Sig     int      `json:"sig"`
+		Cat     int      `json:"cat"`
+		Text    string   `json:"text"`
+		Keep    []string `json:"keep"`
+		Drop    []string `json:"drop"`
+		Off     []string `json:"off"`
+	}{
+		Version: tabPolicyVersion,
+		Salt:    sumHex(o.Salt),
+		Min:     o.MinRows,
+		Sig:     o.SigFigs,
+		Cat:     o.MaxCategorical,
+		Text:    o.Text,
+		Keep:    o.Keep,
+		Drop:    o.Drop,
+		Off:     disabled,
+	})
+	return sumHex(string(raw))[:16]
 }
 
 func sumHex(s string) string {
@@ -96,6 +119,13 @@ func LoadOrCreateSalt(path string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("creating salt directory: %w", err)
 	}
+	// Tighten only a directory we just created. Chmod-ing an arbitrary
+	// existing directory (say /etc) would be a surprise.
+	if info, err := os.Stat(filepath.Dir(path)); err == nil && info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+			return "", fmt.Errorf("tightening salt directory: %w", err)
+		}
+	}
 	buf := make([]byte, SaltSize)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generating salt: %w", err)
@@ -121,6 +151,16 @@ func LoadOrCreateSalt(path string) (string, error) {
 }
 
 func readSalt(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	// A salt readable by another user is a dictionary attack waiting to
+	// happen; refuse rather than silently trust it.
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("salt file %s is readable by other users (mode %o), refusing to use it",
+			path, info.Mode().Perm())
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err

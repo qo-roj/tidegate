@@ -73,9 +73,6 @@ func DefaultOptions() Options {
 
 func (o Options) withDefaults() Options {
 	d := DefaultOptions()
-	if o.Salt == "" {
-		o.Salt = "tidegate"
-	}
 	if o.MinRows <= 0 {
 		o.MinRows = d.MinRows
 	}
@@ -89,6 +86,15 @@ func (o Options) withDefaults() Options {
 		o.Text = d.Text
 	}
 	return o
+}
+
+// disabled reports whether the generalizer for a column type is switched off.
+// "number" covers both numeric types, which is the name users see in config.
+func (o Options) disabled(k colType) bool {
+	if o.Disable[k.disableKey()] {
+		return true
+	}
+	return o.Disable["number"] && (k == typeInt || k == typeFloat)
 }
 
 // Result is the outcome of generalizing one content block.
@@ -117,22 +123,35 @@ type Table struct {
 
 // Generalize detects a table in src and rewrites its cells. When src is not
 // a table, or the guards reject it, Result.Applied is false and Source is
-// src.
+// src. Without a salt nothing is generalized: labels would be computable.
 func Generalize(src string, opt Options) Result {
 	opt = opt.withDefaults()
+	if opt.Salt == "" {
+		return Result{Source: src}
+	}
 	t, ok := Detect(src)
 	if !ok || len(t.Rows) < opt.MinRows {
 		return Result{Source: src, Rows: 0, Cols: 0}
 	}
 
-	cols, dropped := t.narrow(opt)
-	if len(cols) == 0 {
+	cols, dropped, err := t.narrow(opt)
+	if err != nil || len(cols) == 0 {
 		return Result{Source: src}
 	}
 
 	stats := map[string]int{}
 	if dropped > 0 {
 		stats["tabular_cols_dropped"] = dropped
+	}
+
+	// Headers are data too. A header cell that looks like a value is
+	// labelled even though the stricter header heuristic should have
+	// rejected such a block: defence in depth for headerless tables.
+	for i, h := range t.Header {
+		if headerLooksLikeValue(h) {
+			t.Header[i] = reject(opt.Salt, h)
+			stats["tabular_header"]++
+		}
 	}
 
 	// One column at a time: types are inferred from the values, and date
@@ -143,12 +162,15 @@ func Generalize(src string, opt Options) Result {
 			values = append(values, row[ci])
 		}
 		kind := infer(values)
-		if opt.Disable[kind.disableKey()] {
+		if opt.disabled(kind) {
 			continue
 		}
-		n := generalizeColumn(t.Header[ci], values, kind, opt)
-		if n > 0 {
-			stats["tabular_"+kind.statKey()] += n
+		changed, rejected := generalizeColumn(t.Header[ci], values, kind, opt)
+		if changed > 0 {
+			stats["tabular_"+kind.statKey()] += changed
+		}
+		if rejected > 0 {
+			stats["tabular_rejected"] += rejected
 		}
 		for ri := range t.Rows {
 			t.Rows[ri][ci] = values[ri]
@@ -309,12 +331,19 @@ func isSepRow(rec []string) bool {
 	return true
 }
 
-// headerish rejects blocks whose first row is data rather than a header —
-// the main false-positive risk when a source file happens to be delimited.
+// headerish rejects blocks whose first row is data rather than a header — the
+// main false-positive risk when a source file happens to be delimited, and the
+// reason a headerless table must not reach the rewrite path. A real header is
+// made of identifier-shaped words: no "@", no IPv4 dots, no URL scheme, no
+// ISO date, and nothing that parses as a phone number or a card.
 func headerish(header, firstRow []string) bool {
 	letters := 0
 	for i, c := range header {
-		if strings.TrimSpace(c) == "" {
+		c = strings.TrimSpace(c)
+		if c == "" || len(c) > 80 {
+			return false
+		}
+		if !headerCellShaped(c) || headerLooksLikeValue(c) {
 			return false
 		}
 		if strings.IndexFunc(c, func(r rune) bool {
@@ -322,11 +351,55 @@ func headerish(header, firstRow []string) bool {
 		}) >= 0 {
 			letters++
 		}
-		if i < len(firstRow) && strings.EqualFold(strings.TrimSpace(c), strings.TrimSpace(firstRow[i])) {
+		if i < len(firstRow) && strings.EqualFold(c, strings.TrimSpace(firstRow[i])) {
 			return false // header repeats the first data row
 		}
 	}
 	return letters > 0
+}
+
+// headerCellShaped allows the punctuation real column names use and nothing
+// that would be needed to spell an address, a URL or a timestamp.
+func headerCellShaped(c string) bool {
+	for _, r := range c {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune(" _./%()#-", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// headerLooksLikeValue reports whether a cell is a personal value rather than
+// a name for one.
+func headerLooksLikeValue(c string) bool {
+	c = strings.TrimSpace(c)
+	if c == "" {
+		return false
+	}
+	switch {
+	case reEmail.MatchString(c), reUUID.MatchString(c), reSSN.MatchString(c), reURL.MatchString(c):
+		return true
+	case net.ParseIP(c) != nil:
+		return true
+	case isPhone(c), isLuhnCard(c):
+		return true
+	case !parseDate(c).IsZero():
+		return true
+	}
+	return false
+}
+
+// isPhone requires a separator or a leading "+": a bare digit run is an
+// integer id, not a phone number, and treating it as one would hash ids.
+func isPhone(v string) bool {
+	v = strings.TrimSpace(v)
+	if !rePhone.MatchString(v) {
+		return false
+	}
+	return strings.HasPrefix(v, "+") || strings.ContainsAny(v, " ()-.")
 }
 
 // looksLikeCode keeps tabular generalization away from source files that
@@ -411,7 +484,7 @@ func infer(values []string) colType {
 			counts[typeDate]++
 		case reBool.MatchString(v):
 			counts[typeBool]++
-		case rePhone.MatchString(v):
+		case isPhone(v):
 			counts[typePhone]++
 		default:
 			if _, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -425,7 +498,7 @@ func infer(values []string) colType {
 		return typeText
 	}
 	// Specific types win over numeric/text when they reach the threshold.
-	for _, k := range []colType{typeEmail, typeUUID, typeSSN, typeURL, typeIP, typeCard, typeDate, typeBool, typeInt, typeFloat} {
+	for _, k := range []colType{typeEmail, typeUUID, typeSSN, typeURL, typeIP, typeCard, typeDate, typeBool, typePhone, typeInt, typeFloat} {
 		if counts[k]*10 >= total*9 {
 			return k
 		}
@@ -491,33 +564,61 @@ func inferFromHeader(name string) bool {
 	return false
 }
 
-// generalizeColumn rewrites one column in place and returns how many cells
-// changed.
-func generalizeColumn(header string, values []string, kind colType, opt Options) int {
-	n := 0
+// labelHex is the number of hex characters in a value label. Six hex
+// characters (24 bits) collide by birthday around 5k distinct values, which
+// merges entities in a large table; ten (40 bits) is safe well past any table
+// an agent will paste into a prompt.
+const labelHex = 10
+
+// reject is the fail-closed fallback: a cell a typed generalizer could not
+// handle becomes an opaque label instead of shipping verbatim. Losing the
+// column's shape for one cell is acceptable; leaking it is not.
+func reject(salt, v string) string { return label(salt, "v", v, labelHex) }
+
+// generalizeColumn rewrites one column in place. It returns how many cells
+// were generalized in the column's own type and how many fell back to an
+// opaque label because they did not fit that type. In apply mode the caller
+// relies on changed+rejected covering every non-empty cell.
+func generalizeColumn(header string, values []string, kind colType, opt Options) (changed, rejected int) {
 	switch kind {
 	case typeEmail:
 		for i, v := range values {
-			local, domain, ok := strings.Cut(strings.TrimSpace(v), "@")
-			if !ok {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			local, domain, ok := strings.Cut(v, "@")
+			if !ok || !reEmail.MatchString(v) {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
 				continue
 			}
 			// Domain is kept: it is the part analysis code groups by, and
 			// the part that carries no identity on its own.
-			values[i] = label(opt.Salt, "u", local, 6) + "@" + domain
-			n++
+			values[i] = label(opt.Salt, "u", local, labelHex) + "@" + domain
+			changed++
 		}
 	case typeIP:
 		for i, v := range values {
-			if out, ok := generalizeIP(opt.Salt, v); ok {
-				values[i] = out
-				n++
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
 			}
+			out, ok := generalizeIP(opt.Salt, v)
+			if !ok {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
+				continue
+			}
+			values[i] = out
+			changed++
 		}
 	case typePhone:
 		for i, v := range values {
 			v = strings.TrimSpace(v)
-			if !rePhone.MatchString(v) {
+			if v == "" {
+				continue
+			}
+			if !isPhone(v) {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
 				continue
 			}
 			// Keep the country/area prefix (dialling structure), replace
@@ -530,30 +631,43 @@ func generalizeColumn(header string, values []string, kind colType, opt Options)
 				}
 			}
 			values[i] = prefix + " ***-**-" + digits(opt.Salt, v, 4)
-			n++
+			changed++
 		}
 	case typeCard:
 		for i, v := range values {
 			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
 			if !isLuhnCard(v) {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
 				continue
 			}
 			// Keep the leading digit (brand hint) and nothing else.
 			values[i] = string(v[0]) + "**** **** **** " + digits(opt.Salt, v, 4)
-			n++
+			changed++
 		}
 	case typeSSN:
 		for i, v := range values {
 			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
 			if !reSSN.MatchString(v) {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
 				continue
 			}
 			values[i] = "***-**-" + digits(opt.Salt, v, 4)
-			n++
+			changed++
 		}
 	case typeUUID:
 		for i, v := range values {
-			if !reUUID.MatchString(strings.TrimSpace(v)) {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			if !reUUID.MatchString(v) {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
 				continue
 			}
 			h := hashBytes(opt.Salt, v)
@@ -561,59 +675,99 @@ func generalizeColumn(header string, values []string, kind colType, opt Options)
 				hex.EncodeToString(h[0:4]), hex.EncodeToString(h[4:6]),
 				hex.EncodeToString(h[6:7]), hex.EncodeToString(h[7:8]),
 				hex.EncodeToString(h[8:14]))
-			n++
+			changed++
 		}
 	case typeURL:
 		for i, v := range values {
 			v = strings.TrimSpace(v)
-			scheme, _, ok := strings.Cut(v, "://")
-			if !ok {
+			if v == "" {
 				continue
 			}
-			values[i] = scheme + "://" + label(opt.Salt, "h", v, 6) + ".invalid/" + label(opt.Salt, "p", v, 4)
-			n++
+			scheme, _, ok := strings.Cut(v, "://")
+			if !ok {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
+				continue
+			}
+			values[i] = scheme + "://" + label(opt.Salt, "h", v, labelHex) + ".invalid/" + label(opt.Salt, "p", v, 4)
+			changed++
 		}
 	case typeDate:
 		off := dateOffset(opt.Salt)
 		for i, v := range values {
 			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
 			t := parseDate(v)
 			if t.IsZero() {
+				// A cell that does not parse is still a value: label it
+				// rather than ship it in a block that skips patterns.
+				values[i], rejected = reject(opt.Salt, v), rejected+1
 				continue
 			}
 			shifted := t.AddDate(0, 0, off)
 			values[i] = shifted.Format(layoutFor(v))
-			n++
+			changed++
 		}
-	case typeInt, typeFloat:
+	case typeInt:
 		for i, v := range values {
 			trimmed := strings.TrimSpace(v)
+			if trimmed == "" {
+				continue
+			}
+			n, err := strconv.ParseInt(trimmed, 10, 64)
+			if err != nil {
+				// A float, a date or free text in an int column: label it
+				// rather than ship it or silently truncate it.
+				values[i], rejected = reject(opt.Salt, trimmed), rejected+1
+				continue
+			}
+			rounded := strconv.FormatInt(int64(roundSig(float64(n), opt.SigFigs)), 10)
+			if rounded != trimmed {
+				changed++
+			}
+			values[i] = rounded
+		}
+	case typeFloat:
+		for i, v := range values {
+			trimmed := strings.TrimSpace(v)
+			if trimmed == "" {
+				continue
+			}
 			f, err := strconv.ParseFloat(trimmed, 64)
 			if err != nil {
-				continue // "N/A", empty: nothing identifying to remove
+				values[i], rejected = reject(opt.Salt, trimmed), rejected+1
+				continue
 			}
-			r := roundSig(f, opt.SigFigs)
-			if kind == typeInt {
-				values[i] = strconv.FormatInt(int64(r), 10)
-			} else {
-				values[i] = strconv.FormatFloat(r, 'f', -1, 64)
-				// Keep the column's type visible: a float column whose
-				// values all round to whole numbers must not start looking
-				// like an integer column to the agent's parser.
-				if !strings.ContainsAny(values[i], ".eE") {
-					values[i] += ".0"
-				}
+			out := strconv.FormatFloat(roundSig(f, opt.SigFigs), 'f', -1, 64)
+			// Keep the column's type visible: a float column whose values
+			// all round to whole numbers must not start looking like an
+			// integer column to the agent's parser.
+			if !strings.ContainsAny(out, ".eE") {
+				out += ".0"
 			}
-			if values[i] != trimmed {
-				n++
+			if out != trimmed {
+				changed++
 			}
+			values[i] = out
 		}
 	case typeBool:
-		// Booleans carry no identity and code needs their exact spelling.
-		return 0
+		for i, v := range values {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			if !reBool.MatchString(v) {
+				values[i], rejected = reject(opt.Salt, v), rejected+1
+				continue
+			}
+			// Booleans carry no identity and code needs their exact spelling.
+		}
 	case typeText:
 		if opt.Text == "keep" {
-			return 0
+			// Keep is a readability choice, only reachable in shadow mode:
+			// apply refuses to start with anything but hash.
+			return 0, 0
 		}
 		distinct := map[string]struct{}{}
 		for _, v := range values {
@@ -623,17 +777,17 @@ func generalizeColumn(header string, values []string, kind colType, opt Options)
 		}
 		sensitive := inferFromHeader(header)
 		if opt.Text != "hash" && !sensitive && len(distinct) > opt.MaxCategorical {
-			return 0
+			return 0, 0
 		}
 		for i, v := range values {
 			if strings.TrimSpace(v) == "" {
 				continue
 			}
-			values[i] = label(opt.Salt, "v", v, 6)
-			n++
+			values[i] = label(opt.Salt, "v", v, labelHex)
+			changed++
 		}
 	}
-	return n
+	return changed, rejected
 }
 
 // generalizeIP keeps the network prefix and replaces the host part, so
@@ -659,12 +813,13 @@ func generalizeIP(salt, v string) (string, bool) {
 	return strings.Join(groups, ":"), true
 }
 
-// dateOffset is a per-install constant in ±182 days. A single offset for
-// every date keeps intervals, weekday alignment and ordering intact, which is
-// what time-series code depends on; the absolute anchor is wrong by design.
+// dateOffset is a per-install constant in ±91 days and always a whole number
+// of weeks, so intervals, weekday alignment and ordering all survive. A single
+// offset for every date in the block is what makes the intervals exact; the
+// absolute anchor is wrong by design.
 func dateOffset(salt string) int {
 	h := hashBytes(salt, "date-offset")
-	return int(binary.BigEndian.Uint16(h[:2]))%365 - 182
+	return (int(binary.BigEndian.Uint16(h[:2]))%27)*7 - 91
 }
 
 func layoutFor(v string) string {
@@ -738,9 +893,15 @@ func (t colType) disableKey() string { return t.statKey() }
 
 // narrow applies the Keep/Drop header policy. It returns the surviving
 // column indexes and how many were removed.
-func (t *Table) narrow(opt Options) ([]int, int) {
-	keepRe := compileAll(opt.Keep)
-	dropRe := compileAll(opt.Drop)
+func (t *Table) narrow(opt Options) ([]int, int, error) {
+	keepRe, err := compileAll(opt.Keep)
+	if err != nil {
+		return nil, 0, err
+	}
+	dropRe, err := compileAll(opt.Drop)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	var idx []int
 	removed := 0
@@ -757,7 +918,7 @@ func (t *Table) narrow(opt Options) ([]int, int) {
 		idx = append(idx, i)
 	}
 	if removed == 0 {
-		return idx, 0
+		return idx, 0, nil
 	}
 	header := make([]string, len(idx))
 	rows := make([][]string, len(t.Rows))
@@ -772,17 +933,28 @@ func (t *Table) narrow(opt Options) ([]int, int) {
 		rows[r] = row
 	}
 	t.Header, t.Rows = header, rows
-	return idx, removed
+	if t.SepRow != nil {
+		sep := make([]string, len(idx))
+		for n, i := range idx {
+			if i < len(t.SepRow) {
+				sep[n] = t.SepRow[i]
+			}
+		}
+		t.SepRow = sep
+	}
+	return idx, removed, nil
 }
 
-func compileAll(patterns []string) []*regexp.Regexp {
+func compileAll(patterns []string) ([]*regexp.Regexp, error) {
 	var out []*regexp.Regexp
 	for _, p := range patterns {
-		if re, err := regexp.Compile("(?i)" + p); err == nil {
-			out = append(out, re)
+		re, err := regexp.Compile("(?i)" + p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid column pattern %q: %w", p, err)
 		}
+		out = append(out, re)
 	}
-	return out
+	return out, nil
 }
 
 func matchAny(res []*regexp.Regexp, s string) bool {
@@ -836,7 +1008,19 @@ func (t *Table) renderMarkdown(cols int) string {
 	if t.SepRow != nil {
 		sep := make([]string, cols)
 		for i := range sep {
-			sep[i] = strings.Repeat("-", max(3, widths[i]))
+			w := max(3, widths[i])
+			left := strings.HasPrefix(strings.TrimSpace(t.SepRow[i]), ":")
+			right := strings.HasSuffix(strings.TrimSpace(t.SepRow[i]), ":")
+			switch {
+			case left && right && w >= 3:
+				sep[i] = ":" + strings.Repeat("-", w-2) + ":"
+			case left:
+				sep[i] = ":" + strings.Repeat("-", w-1)
+			case right:
+				sep[i] = strings.Repeat("-", w-1) + ":"
+			default:
+				sep[i] = strings.Repeat("-", w)
+			}
 		}
 		writeRow(sep)
 	}

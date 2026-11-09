@@ -850,8 +850,20 @@ structure the transform exists to preserve. This is safe only while every cell
 is a label or a number, which is why `text = hash` is the default and the
 gateway warns when `auto`/`keep` is combined with `apply`.
 
+### Decision: fail closed per cell, and refuse unsafe apply configs
+
+Column typing works at a 90% threshold, so a table can contain cells that do
+not fit their column. Those cells are labelled with the same opaque hash a
+text column gets (`tabular_rejected`), never forwarded. Headers are checked in
+two layers: a block only qualifies when every header cell is identifier-shaped
+and none parses as a value, and any header cell that still looks like a value
+is labelled. `apply` refuses to start unless `text = hash` and `disable` is
+empty, because either setting leaves a cell type untouched in a block that no
+longer receives the pattern pass. A startup warning would be a
+config-reachable hole.
+
 ### Trade-off
 
 Row counts, column names and cardinalities are still visible. Absolute values
-are wrong by construction. `shadow` mode exists so the transform can be
-measured on real traffic before it changes a single answer.
+are wrong by construction. All presets ship `shadow` until the shadow numbers
+have been reviewed; `apply` is a deliberate opt-in.

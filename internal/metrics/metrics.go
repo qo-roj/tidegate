@@ -139,7 +139,9 @@ func (m *Registry) ObserveTabularBlocks(summary map[string]int) {
 		default:
 			continue
 		}
-		if kind == "blocks" || n == 0 {
+		// "blocks" is counted separately and cols_dropped counts columns,
+		// not rewritten cells.
+		if kind == "blocks" || kind == "cols_dropped" || n == 0 {
 			continue
 		}
 		m.tabularCells[tabularCell{mode: mode, kind: kind}] += int64(n)

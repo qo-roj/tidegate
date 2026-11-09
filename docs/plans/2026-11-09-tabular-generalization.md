@@ -206,3 +206,22 @@ Also added: `tidegate_tabular_cells_total{mode,kind}` and tabular counters
 excluded from `tidegate_redactions_total` (a generalized cell is not a
 redaction), plus the redaction-cache fingerprint now includes the tabular
 policy so a salt or threshold change cannot serve stale output.
+
+## Review round (post-block)
+
+Sid's probe review blocked the first wiring. Fixes applied in the same branch:
+
+- fail-closed per cell: a typed generalizer that rejects a value labels it
+  instead of forwarding it, counted as `tabular_rejected`
+- stricter header heuristic plus value-shaped header labelling; headerless
+  tables no longer qualify
+- `apply` refuses unless `text = hash` and `disable` is empty
+- `typePhone` is reachable (it was missing from the winner list) and no longer
+  swallows bare digit ids; `disable = ["number"]` maps to int and float
+- salt path expands `~` and must be absolute; unreadable or group-readable
+  salts are fatal; the built-in default salt is gone
+- labels widened to 10 hex, policy fingerprint JSON-encoded with a version
+  marker, date offset a whole number of weeks
+- invalid column patterns fail at config load; dropped columns no longer
+  counted as generalized cells; markdown alignment preserved
+- presets back to `shadow` for this release train

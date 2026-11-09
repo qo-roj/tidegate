@@ -35,6 +35,9 @@ func TestTabularBlocksMetric(t *testing.T) {
 	if !strings.Contains(body, `tidegate_tabular_cells_total{mode="apply",kind="email"} 4`) {
 		t.Errorf("per-kind cell counter missing:\n%s", body)
 	}
+	if strings.Contains(body, `kind="cols_dropped"`) {
+		t.Errorf("dropped columns counted as generalized cells:\n%s", body)
+	}
 	if strings.Contains(body, `tidegate_redactions_total{pattern="tabular_email"}`) {
 		t.Errorf("tabular cells leaked into the redaction counter:\n%s", body)
 	}

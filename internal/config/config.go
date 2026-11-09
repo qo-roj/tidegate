@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -117,6 +118,72 @@ func (t Tabular) Options() tabular.Options {
 
 // ParsedMode is the tabular mode as a Mode value.
 func (t Tabular) ParsedMode() tabular.Mode { return tabular.ParseMode(t.Mode) }
+
+// knownGeneralizers are the names accepted in [tabular] disable.
+var knownGeneralizers = map[string]bool{
+	"email": true, "ip": true, "phone": true, "card": true, "ssn": true,
+	"uuid": true, "url": true, "date": true, "number": true, "text": true,
+}
+
+// Validate checks the [tabular] section at load time. A bad pattern, an
+// unknown generalizer name or a relative salt path must fail here rather than
+// silently doing nothing at request time.
+func (t Tabular) Validate() error {
+	switch strings.ToLower(strings.TrimSpace(t.Mode)) {
+	case "", "off", "shadow", "apply":
+	default:
+		return fmt.Errorf("tabular: unknown mode %q (want off, shadow or apply)", t.Mode)
+	}
+	switch t.Text {
+	case "", "hash", "auto", "keep":
+	default:
+		return fmt.Errorf("tabular: unknown text policy %q (want hash, auto or keep)", t.Text)
+	}
+	for _, name := range t.Disable {
+		if !knownGeneralizers[strings.ToLower(strings.TrimSpace(name))] {
+			return fmt.Errorf("tabular: unknown generalizer %q in disable", name)
+		}
+	}
+	if t.SaltFile != "" && !filepath.IsAbs(t.SaltFile) {
+		return fmt.Errorf("tabular: salt_file must be an absolute path, got %q", t.SaltFile)
+	}
+	for _, p := range append(append([]string{}, t.Keep...), t.Drop...) {
+		if _, err := regexp.Compile("(?i)" + p); err != nil {
+			return fmt.Errorf("tabular: invalid column pattern %q: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// ApplySafe refuses the configurations under which apply mode would forward
+// raw cells: any text policy but hash leaves free text untouched, and a
+// disabled generalizer leaves its whole column type untouched. Both are fine
+// in shadow mode, where nothing is rewritten.
+func (t Tabular) ApplySafe() error {
+	if t.Text != "hash" {
+		return fmt.Errorf("tabular: mode = apply requires text = hash (got %q); other text policies leave raw cells in blocks that skip pattern redaction", t.Text)
+	}
+	if len(t.Disable) > 0 {
+		return fmt.Errorf("tabular: mode = apply does not support disable = %v; a disabled generalizer leaves that column type raw", t.Disable)
+	}
+	return nil
+}
+
+// expandUserPath resolves a leading ~ so a config copied from the docs does
+// not create a literal "./~" directory relative to the service's CWD.
+func expandUserPath(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return filepath.Join(home, p[2:])
+}
 
 // Load resolves configuration from all sources in order:
 //  1. Built-in defaults (embedded in binary)
@@ -270,6 +337,14 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	cfg.Cloud.AnthropicKey = os.Getenv("ANTHROPIC_API_KEY")
 	cfg.Cloud.OpenAIKey = os.Getenv("OPENAI_API_KEY")
 	cfg.Cloud.XAIKey = os.Getenv("XAI_API_KEY")
+
+	// [tabular] is validated at load time: a bad pattern, an unknown
+	// generalizer or a relative salt path must fail here rather than
+	// silently doing nothing per request.
+	cfg.Tabular.SaltFile = expandUserPath(cfg.Tabular.SaltFile)
+	if err := cfg.Tabular.Validate(); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
 }

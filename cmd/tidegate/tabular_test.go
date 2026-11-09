@@ -1,9 +1,11 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/qo-roj/tidegate/internal/config"
 	"github.com/qo-roj/tidegate/internal/redact"
 	"github.com/qo-roj/tidegate/internal/tabular"
 )
@@ -46,5 +48,30 @@ func TestRunTextWithoutTabularIsUnchanged(t *testing.T) {
 	off, _ := runTextWith(cliTable, redact.New(), &tabular.Options{Salt: "cli-test"}, tabular.ModeOff)
 	if legacy != off {
 		t.Error("ModeOff differs from the legacy CLI path")
+	}
+}
+
+func TestTabularApplyRefusesUnsafePolicy(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.AppConfig{Tabular: config.Tabular{
+		Mode: "apply", Text: "keep", SaltFile: filepath.Join(dir, "salt"),
+	}}
+	if _, _, err := tabularOptions(cfg); err == nil {
+		t.Fatal("apply + text=keep was accepted")
+	}
+
+	cfg.Tabular.Text = "hash"
+	cfg.Tabular.Disable = []string{"email"}
+	if _, _, err := tabularOptions(cfg); err == nil {
+		t.Fatal("apply + disable=[email] was accepted")
+	}
+
+	cfg.Tabular.Disable = nil
+	opts, mode, err := tabularOptions(cfg)
+	if err != nil {
+		t.Fatalf("valid apply policy refused: %v", err)
+	}
+	if mode != tabular.ModeApply || opts == nil || opts.Salt == "" {
+		t.Fatalf("mode=%v opts=%+v", mode, opts)
 	}
 }

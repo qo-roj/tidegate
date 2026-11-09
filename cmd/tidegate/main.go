@@ -234,14 +234,11 @@ func cmdStart(args []string) {
 	// Table generalization policy. Mode off means nothing is generalized.
 	tabOpts, tabMode, err := tabularOptions(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading tabular salt: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tabular configuration error: %v\n", err)
 		os.Exit(1)
 	}
 	if tabMode != tabular.ModeOff {
 		fmt.Printf("   Tabular: %s (sig_figs %d, min_rows %d, text %s)\n", tabMode, cfg.Tabular.SigFigs, cfg.Tabular.MinRows, cfg.Tabular.Text)
-		if tabMode == tabular.ModeApply && cfg.Tabular.Text != "hash" {
-			fmt.Fprintf(os.Stderr, "   ⚠ tabular: text = %s leaves free-text columns raw, and pattern redaction is skipped for generalized tables\n", cfg.Tabular.Text)
-		}
 	} else {
 		fmt.Printf("   Tabular: off\n")
 	}
@@ -667,12 +664,17 @@ func parseSince(s string) time.Time {
 
 // tabularOptions resolves the [tabular] policy and loads the per-install salt.
 // Nil options mean "off": no block is ever generalized on that path. A salt
-// that cannot be read is fatal rather than silently falling back to the
-// built-in default, which would make labels guessable for known values.
+// that cannot be read is fatal rather than silently falling back to a weak
+// default, and apply mode refuses configurations that would leave raw cells.
 func tabularOptions(cfg *config.AppConfig) (*tabular.Options, tabular.Mode, error) {
 	mode := cfg.Tabular.ParsedMode()
 	if mode == tabular.ModeOff {
 		return nil, tabular.ModeOff, nil
+	}
+	if mode == tabular.ModeApply {
+		if err := cfg.Tabular.ApplySafe(); err != nil {
+			return nil, mode, err
+		}
 	}
 	opts := cfg.Tabular.Options()
 	salt, err := tabular.LoadOrCreateSalt(cfg.Tabular.SaltFile)

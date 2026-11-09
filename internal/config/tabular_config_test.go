@@ -59,9 +59,9 @@ func TestTabularDefaultsAndPresets(t *testing.T) {
 		wantText string
 	}{
 		{preset: "desktop", mode: "shadow", text: "hash", sigFigs: 2, minRows: 3},
-		{preset: "server", mode: "apply", text: "hash", sigFigs: 2, minRows: 3},
-		{preset: "paranoid", mode: "apply", text: "hash", sigFigs: 1, minRows: 3},
-		{preset: "training-data", mode: "apply", text: "hash", sigFigs: 2, minRows: 3},
+		{preset: "server", mode: "shadow", text: "hash", sigFigs: 2, minRows: 3},
+		{preset: "paranoid", mode: "shadow", text: "hash", sigFigs: 2, minRows: 3},
+		{preset: "training-data", mode: "shadow", text: "hash", sigFigs: 2, minRows: 3},
 	}
 
 	for _, c := range cases {
@@ -116,5 +116,81 @@ func writeFile(t *testing.T, path, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("writing %s: %v", path, err)
+	}
+}
+
+func TestTabularValidateRejectsBadConfig(t *testing.T) {
+	bad := []Tabular{
+		{Mode: "sideways"},
+		{Text: "plain"},
+		{Disable: []string{"emails"}},
+		{SaltFile: "relative/salt"},
+		{Drop: []string{"("}},
+	}
+	for _, c := range bad {
+		if err := c.Validate(); err == nil {
+			t.Errorf("Validate accepted %+v", c)
+		}
+	}
+
+	good := Tabular{Mode: "apply", Text: "hash", SaltFile: "/tmp/salt", Drop: []string{"^card$"}}
+	if err := good.Validate(); err != nil {
+		t.Errorf("Validate rejected a valid section: %v", err)
+	}
+}
+
+func TestTabularApplySafe(t *testing.T) {
+	if err := (Tabular{Mode: "apply", Text: "auto"}).ApplySafe(); err == nil {
+		t.Error("apply with text=auto must be refused")
+	}
+	if err := (Tabular{Mode: "apply", Text: "keep"}).ApplySafe(); err == nil {
+		t.Error("apply with text=keep must be refused")
+	}
+	if err := (Tabular{Mode: "apply", Text: "hash", Disable: []string{"email"}}).ApplySafe(); err == nil {
+		t.Error("apply with a disabled generalizer must be refused")
+	}
+	if err := (Tabular{Mode: "apply", Text: "hash"}).ApplySafe(); err != nil {
+		t.Errorf("valid apply policy refused: %v", err)
+	}
+}
+
+func TestExpandUserPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory")
+	}
+	if got := expandUserPath("~/x/salt"); got != filepath.Join(home, "x", "salt") {
+		t.Errorf("expandUserPath = %q", got)
+	}
+	if got := expandUserPath("/absolute/salt"); got != "/absolute/salt" {
+		t.Errorf("absolute path changed: %q", got)
+	}
+	if got := expandUserPath("relative"); got != "relative" {
+		t.Errorf("relative path changed: %q", got)
+	}
+}
+
+func TestLoadRejectsRelativeTabularSalt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeFile(t, filepath.Join(home, ".config", "tidegate", "tidegate.conf"),
+		"[tabular]\nmode = shadow\nsalt_file = relative.salt\n")
+	if _, err := Load(0, "server"); err == nil {
+		t.Fatal("Load accepted a relative salt_file")
+	}
+}
+
+func TestLoadExpandsTildeSaltPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeFile(t, filepath.Join(home, ".config", "tidegate", "tidegate.conf"),
+		"[tabular]\nmode = shadow\nsalt_file = ~/.config/tidegate/salt.test\n")
+	cfg, err := Load(0, "server")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := filepath.Join(home, ".config", "tidegate", "salt.test")
+	if cfg.Tabular.SaltFile != want {
+		t.Errorf("salt_file = %q, want %q", cfg.Tabular.SaltFile, want)
 	}
 }

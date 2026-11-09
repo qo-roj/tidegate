@@ -90,7 +90,7 @@ Redacts sensitive data (IPs, emails, keys...) so it is safe to paste anywhere.`)
 
 	tabOpts, tabMode, err := tabularOptions(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading tabular salt: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tabular configuration error: %v\n", err)
 		os.Exit(1)
 	}
 
