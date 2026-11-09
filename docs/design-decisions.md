@@ -823,3 +823,47 @@ Both preserve byte layout, so prompt prefixes stay stable.
 Detection is heuristic. A malformed or mixed document falls back to `text` and
 pattern-only redaction. JSON key redaction is deliberately conservative:
 only string values directly under a sensitive key, never whole objects.
+
+## Issue 12: Table Generalization Is Irreversible (v0.8.0)
+
+### Problem
+
+Token redaction preserves identity but destroys utility for data tables. An
+agent that receives `email=[TG:EMAIL:1], amount=[TG:NUM:2]` for every row can
+no longer write code that groups, joins, casts or validates anything.
+
+### Decision: a second, irreversible transform
+
+`internal/tabular` rewrites table cells in place: salted labels for text and
+identifiers, real domains for emails, `/16` prefixes for IPs, a constant
+per-install offset for dates, and significant-figure rounding for numbers.
+Labels are hashes of the value, so they are stable across turns and row
+order without any per-session state — and they cannot be reversed, by design.
+There is no vault entry and no rehydration path.
+
+### Decision: pattern redaction is skipped for generalized blocks
+
+Generalization must run before patterns (otherwise `[TG:EMAIL:1]` destroys type
+inference), and in `apply` mode the block is returned before the pattern pass.
+Running patterns afterwards would re-tokenize the labels and destroy the
+structure the transform exists to preserve. This is safe only while every cell
+is a label or a number, which is why `text = hash` is the default and the
+gateway warns when `auto`/`keep` is combined with `apply`.
+
+### Decision: fail closed per cell, and refuse unsafe apply configs
+
+Column typing works at a 90% threshold, so a table can contain cells that do
+not fit their column. Those cells are labelled with the same opaque hash a
+text column gets (`tabular_rejected`), never forwarded. Headers are checked in
+two layers: a block only qualifies when every header cell is identifier-shaped
+and none parses as a value, and any header cell that still looks like a value
+is labelled. `apply` refuses to start unless `text = hash` and `disable` is
+empty, because either setting leaves a cell type untouched in a block that no
+longer receives the pattern pass. A startup warning would be a
+config-reachable hole.
+
+### Trade-off
+
+Row counts, column names and cardinalities are still visible. Absolute values
+are wrong by construction. All presets ship `shadow` until the shadow numbers
+have been reviewed; `apply` is a deliberate opt-in.

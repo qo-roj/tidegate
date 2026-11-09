@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/qo-roj/tidegate/internal/rules"
+	"github.com/qo-roj/tidegate/internal/tabular"
 )
 
 //go:embed rules/defaults.conf
@@ -70,13 +72,117 @@ type Local struct {
 	OllamaModel string
 }
 
+// Tabular holds the table-generalization policy ([tabular] section).
+// Settings are only used when Mode is not "off"; the gateway defaults to
+// "shadow" so the transform can be judged on real traffic before it rewrites
+// anything.
+type Tabular struct {
+	Mode           string // off | shadow | apply
+	MinRows        int
+	SigFigs        int
+	MaxCategorical int
+	Text           string // hash (default) | auto | keep
+	SaltFile       string
+	Keep           []string
+	Drop           []string
+	Disable        []string
+}
+
 // AppConfig is the fully resolved configuration.
 type AppConfig struct {
 	Gateway Gateway
 	Cloud   Cloud
 	Local   Local
+	Tabular Tabular
 	Clients []Client // gateway-mode clients, in config order
 	RuleSet *rules.RuleSet
+}
+
+// Options converts the config section into tabular options. The salt is not
+// read here: the caller loads it once, because it touches the filesystem.
+func (t Tabular) Options() tabular.Options {
+	disable := make(map[string]bool, len(t.Disable))
+	for _, name := range t.Disable {
+		disable[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	return tabular.Options{
+		MinRows:        t.MinRows,
+		SigFigs:        t.SigFigs,
+		MaxCategorical: t.MaxCategorical,
+		Text:           t.Text,
+		Keep:           t.Keep,
+		Drop:           t.Drop,
+		Disable:        disable,
+	}
+}
+
+// ParsedMode is the tabular mode as a Mode value.
+func (t Tabular) ParsedMode() tabular.Mode { return tabular.ParseMode(t.Mode) }
+
+// knownGeneralizers are the names accepted in [tabular] disable.
+var knownGeneralizers = map[string]bool{
+	"email": true, "ip": true, "phone": true, "card": true, "ssn": true,
+	"uuid": true, "url": true, "date": true, "number": true, "text": true,
+}
+
+// Validate checks the [tabular] section at load time. A bad pattern, an
+// unknown generalizer name or a relative salt path must fail here rather than
+// silently doing nothing at request time.
+func (t Tabular) Validate() error {
+	switch strings.ToLower(strings.TrimSpace(t.Mode)) {
+	case "", "off", "shadow", "apply":
+	default:
+		return fmt.Errorf("tabular: unknown mode %q (want off, shadow or apply)", t.Mode)
+	}
+	switch t.Text {
+	case "", "hash", "auto", "keep":
+	default:
+		return fmt.Errorf("tabular: unknown text policy %q (want hash, auto or keep)", t.Text)
+	}
+	for _, name := range t.Disable {
+		if !knownGeneralizers[strings.ToLower(strings.TrimSpace(name))] {
+			return fmt.Errorf("tabular: unknown generalizer %q in disable", name)
+		}
+	}
+	if t.SaltFile != "" && !filepath.IsAbs(t.SaltFile) {
+		return fmt.Errorf("tabular: salt_file must be an absolute path, got %q", t.SaltFile)
+	}
+	for _, p := range append(append([]string{}, t.Keep...), t.Drop...) {
+		if _, err := regexp.Compile("(?i)" + p); err != nil {
+			return fmt.Errorf("tabular: invalid column pattern %q: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// ApplySafe refuses the configurations under which apply mode would forward
+// raw cells: any text policy but hash leaves free text untouched, and a
+// disabled generalizer leaves its whole column type untouched. Both are fine
+// in shadow mode, where nothing is rewritten.
+func (t Tabular) ApplySafe() error {
+	if t.Text != "hash" {
+		return fmt.Errorf("tabular: mode = apply requires text = hash (got %q); other text policies leave raw cells in blocks that skip pattern redaction", t.Text)
+	}
+	if len(t.Disable) > 0 {
+		return fmt.Errorf("tabular: mode = apply does not support disable = %v; a disabled generalizer leaves that column type raw", t.Disable)
+	}
+	return nil
+}
+
+// expandUserPath resolves a leading ~ so a config copied from the docs does
+// not create a literal "./~" directory relative to the service's CWD.
+func expandUserPath(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return filepath.Join(home, p[2:])
 }
 
 // Load resolves configuration from all sources in order:
@@ -87,6 +193,7 @@ type AppConfig struct {
 //  4. Project-local config (./.tidegate.conf)
 //  5. CLI flags (passed as params)
 func Load(cliPort int, cliPreset string) (*AppConfig, error) {
+	home, _ := os.UserHomeDir()
 	cfg := &AppConfig{
 		Gateway: Gateway{
 			Port:        8842,
@@ -99,6 +206,14 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 		Local: Local{
 			OllamaURL:   "http://localhost:11434",
 			OllamaModel: "llama3:8b",
+		},
+		Tabular: Tabular{
+			Mode:           "shadow",
+			MinRows:        3,
+			SigFigs:        2,
+			MaxCategorical: 200,
+			Text:           "hash",
+			SaltFile:       filepath.Join(home, ".config", "tidegate", "tabular.salt"),
 		},
 	}
 
@@ -119,7 +234,6 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	if cliPreset != "" {
 		presetChoice = cliPreset
 	}
-	home, _ := os.UserHomeDir()
 	userConfigPath := filepath.Join(home, ".config", "tidegate", "tidegate.conf")
 	var userCfg, projCfg *rules.Config
 	if fileExists(userConfigPath) {
@@ -148,6 +262,11 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	presetData, err := loadPreset(cfg.Gateway.Preset)
 	if err != nil {
 		return nil, fmt.Errorf("loading preset %s: %w", cfg.Gateway.Preset, err)
+	}
+	// Presets carry [gateway]/[local]/[tabular] settings as well as rules.
+	// They are applied before user and project files so both can override.
+	if presetData != nil {
+		applyGatewayBytes(cfg, presetData)
 	}
 
 	// Build the ordered layer list: defaults → preset → user → project.
@@ -219,6 +338,14 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	cfg.Cloud.OpenAIKey = os.Getenv("OPENAI_API_KEY")
 	cfg.Cloud.XAIKey = os.Getenv("XAI_API_KEY")
 
+	// [tabular] is validated at load time: a bad pattern, an unknown
+	// generalizer or a relative salt path must fail here rather than
+	// silently doing nothing per request.
+	cfg.Tabular.SaltFile = expandUserPath(cfg.Tabular.SaltFile)
+	if err := cfg.Tabular.Validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
 }
 
@@ -237,6 +364,12 @@ func applyGatewayFile(cfg *AppConfig, path string) {
 	if err != nil {
 		return
 	}
+	applyGatewayBytes(cfg, data)
+}
+
+// applyGatewayBytes is applyGatewayFile for config bytes that are already in
+// memory (embedded presets).
+func applyGatewayBytes(cfg *AppConfig, data []byte) {
 	section := ""
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
@@ -292,8 +425,54 @@ func applyGatewayFile(cfg *AppConfig, path string) {
 			case "ollama_model":
 				cfg.Local.OllamaModel = v
 			}
+		case "tabular":
+			switch k {
+			case "mode":
+				cfg.Tabular.Mode = strings.ToLower(v)
+			case "min_rows":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.Tabular.MinRows = n
+				}
+			case "sig_figs":
+				if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 8 {
+					cfg.Tabular.SigFigs = n
+				}
+			case "max_categorical":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.Tabular.MaxCategorical = n
+				}
+			case "text":
+				cfg.Tabular.Text = strings.ToLower(v)
+			case "salt_file":
+				cfg.Tabular.SaltFile = v
+			case "keep":
+				cfg.Tabular.Keep = splitCSVList(v)
+			case "drop":
+				cfg.Tabular.Drop = splitCSVList(v)
+			case "disable":
+				cfg.Tabular.Disable = splitCSVList(v)
+			}
 		}
 	}
+}
+
+// splitCSVList parses a list-valued config entry. Bare comma-separated values
+// are the canonical form; a TOML-style bracket array is also accepted because
+// it is what people write in a .conf file that looks like TOML.
+func splitCSVList(v string) []string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "[")
+	v = strings.TrimSuffix(v, "]")
+
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		p := strings.TrimSpace(part)
+		p = strings.TrimSpace(strings.Trim(p, `"'`))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // stripHashComment removes a trailing " #..." comment from a value.

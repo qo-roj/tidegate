@@ -21,6 +21,7 @@ import (
 	"github.com/qo-roj/tidegate/internal/proxy"
 	"github.com/qo-roj/tidegate/internal/route"
 	"github.com/qo-roj/tidegate/internal/rules"
+	"github.com/qo-roj/tidegate/internal/tabular"
 	"github.com/qo-roj/tidegate/internal/vault"
 )
 
@@ -230,6 +231,18 @@ func cmdStart(args []string) {
 	defer v.Close()
 	fmt.Printf("   Vault: %s (ttl %s)\n", vaultPath, cfg.Gateway.VaultTTL)
 
+	// Table generalization policy. Mode off means nothing is generalized.
+	tabOpts, tabMode, err := tabularOptions(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Tabular configuration error: %v\n", err)
+		os.Exit(1)
+	}
+	if tabMode != tabular.ModeOff {
+		fmt.Printf("   Tabular: %s (sig_figs %d, min_rows %d, text %s)\n", tabMode, cfg.Tabular.SigFigs, cfg.Tabular.MinRows, cfg.Tabular.Text)
+	} else {
+		fmt.Printf("   Tabular: off\n")
+	}
+
 	// Metrics registry + listener.
 	reg := metrics.New()
 	reg.SetVaultStats(v.Stats)
@@ -246,6 +259,9 @@ func cmdStart(args []string) {
 
 	// Initialize router
 	router := route.New(cfg.RuleSet, ollamaClient, auditLog).WithVault(v)
+	if tabOpts != nil {
+		router.WithTabular(*tabOpts, tabMode)
+	}
 
 	// Initialize and start proxy
 	srv := proxy.New(router, auditLog, cfg.Gateway.Port)
@@ -644,4 +660,27 @@ func parseSince(s string) time.Time {
 		d = 24 * time.Hour
 	}
 	return time.Now().Add(-d)
+}
+
+// tabularOptions resolves the [tabular] policy and loads the per-install salt.
+// Nil options mean "off": no block is ever generalized on that path. A salt
+// that cannot be read is fatal rather than silently falling back to a weak
+// default, and apply mode refuses configurations that would leave raw cells.
+func tabularOptions(cfg *config.AppConfig) (*tabular.Options, tabular.Mode, error) {
+	mode := cfg.Tabular.ParsedMode()
+	if mode == tabular.ModeOff {
+		return nil, tabular.ModeOff, nil
+	}
+	if mode == tabular.ModeApply {
+		if err := cfg.Tabular.ApplySafe(); err != nil {
+			return nil, mode, err
+		}
+	}
+	opts := cfg.Tabular.Options()
+	salt, err := tabular.LoadOrCreateSalt(cfg.Tabular.SaltFile)
+	if err != nil {
+		return nil, mode, err
+	}
+	opts.Salt = salt
+	return &opts, mode, nil
 }
