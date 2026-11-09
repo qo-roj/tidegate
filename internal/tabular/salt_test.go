@@ -89,3 +89,26 @@ func TestFingerprintTracksPolicy(t *testing.T) {
 		t.Error("generalizer toggle did not change the fingerprint")
 	}
 }
+
+func TestLoadOrCreateSaltLeavesExistingDirAlone(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "preexisting")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreateSalt(filepath.Join(dir, "tabular.salt")); err != nil {
+		t.Fatalf("LoadOrCreateSalt: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("pre-existing directory mode changed to %o, want 755", perm)
+	}
+}
+
+func TestLoadOrCreateSaltRejectsRelativePath(t *testing.T) {
+	if _, err := LoadOrCreateSalt("relative/tabular.salt"); err == nil {
+		t.Fatal("relative salt path accepted")
+	}
+}

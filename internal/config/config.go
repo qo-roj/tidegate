@@ -456,12 +456,19 @@ func applyGatewayBytes(cfg *AppConfig, data []byte) {
 	}
 }
 
-// splitCSVList parses a comma-separated config value into trimmed entries.
-// Empty entries are dropped, so "a, ,b" is [a b] rather than three items.
+// splitCSVList parses a list-valued config entry. Bare comma-separated values
+// are the canonical form; a TOML-style bracket array is also accepted because
+// it is what people write in a .conf file that looks like TOML.
 func splitCSVList(v string) []string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "[")
+	v = strings.TrimSuffix(v, "]")
+
 	var out []string
 	for _, part := range strings.Split(v, ",") {
-		if p := strings.TrimSpace(part); p != "" {
+		p := strings.TrimSpace(part)
+		p = strings.TrimSpace(strings.Trim(p, `"'`))
+		if p != "" {
 			out = append(out, p)
 		}
 	}

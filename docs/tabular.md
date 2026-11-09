@@ -131,11 +131,15 @@ min_rows = 3           # smallest table worth generalizing
 sig_figs = 2           # significant figures kept in numeric columns
 text = "hash"          # hash | auto | keep
 max_categorical = 200  # text columns at or below this cardinality are hashed under "auto"
-salt_file = "~/.config/tidegate/tabular.salt"   # ~ is expanded; must be absolute
-keep = []              # header regexes; non-empty means allowlist only
-drop = ["card_number", "billing_address"]
-disable = ["url"]      # email, ip, phone, card, ssn, uuid, url, date, number, text
+salt_file = ~/.config/tidegate/tabular.salt   # ~ is expanded; must be absolute
+keep =                 # header regexes, comma-separated; non-empty = allowlist
+drop = card_number, billing_address
+disable = url          # email, ip, phone, card, ssn, uuid, url, date, number, text
 ```
+
+Lists are comma-separated (`drop = card_number, billing_address`); a
+TOML-style bracket array is also accepted, but quotes belong around whole
+values, not inside them.
 
 The salt is generated on first use (32 random bytes, hex, `0600`, in a `0700`
 directory). It is what stops a label from being a dictionary lookup on a known

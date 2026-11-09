@@ -194,3 +194,33 @@ func TestLoadExpandsTildeSaltPath(t *testing.T) {
 		t.Errorf("salt_file = %q, want %q", cfg.Tabular.SaltFile, want)
 	}
 }
+
+func TestTabularAcceptsBracketLists(t *testing.T) {
+	cfg := &AppConfig{}
+	applyGatewayBytes(cfg, []byte(`
+[tabular]
+mode = shadow
+keep = ["id", "email"]
+drop = ["card_number"]
+disable = ["url", "date"]
+`))
+	if len(cfg.Tabular.Keep) != 2 || cfg.Tabular.Keep[0] != "id" {
+		t.Errorf("keep = %v", cfg.Tabular.Keep)
+	}
+	if len(cfg.Tabular.Drop) != 1 || cfg.Tabular.Drop[0] != "card_number" {
+		t.Errorf("drop = %v", cfg.Tabular.Drop)
+	}
+	if len(cfg.Tabular.Disable) != 2 || cfg.Tabular.Disable[1] != "date" {
+		t.Errorf("disable = %v", cfg.Tabular.Disable)
+	}
+	if err := cfg.Tabular.Validate(); err != nil {
+		t.Errorf("bracket lists failed validation: %v", err)
+	}
+
+	// An empty bracket array is an empty list, not an invalid pattern.
+	cfg2 := &AppConfig{}
+	applyGatewayBytes(cfg2, []byte("[tabular]\nkeep = []\ndrop = []\n"))
+	if err := cfg2.Tabular.Validate(); err != nil {
+		t.Errorf("empty lists failed validation: %v", err)
+	}
+}

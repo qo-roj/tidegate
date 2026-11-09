@@ -40,7 +40,7 @@ import (
 type Options struct {
 	// Salt separates this install's labels from any other. Without it, a
 	// label for a known value (a well-known email address, say) could be
-	// computed by an attacker and matched. Empty means "tidegate".
+	// computed by an attacker and matched. Empty means no generalization.
 	Salt string
 	// MinRows is the smallest number of data rows worth generalizing.
 	MinRows int
@@ -845,7 +845,7 @@ func hashBytes(salt, v string) []byte {
 	return sum[:]
 }
 
-// label builds a salted, stable, six-hex-character placeholder.
+// label builds a salted, stable placeholder of n hex characters.
 func label(salt, prefix, v string, n int) string {
 	return prefix + hex.EncodeToString(hashBytes(salt, v))[:n]
 }
@@ -993,6 +993,13 @@ func (t *Table) renderMarkdown(cols int) string {
 			widths[i] = max(widths[i], len(c))
 		}
 	}
+	// A markdown separator cell is at least three characters wide. Clamp the
+	// column widths to match: otherwise a two-character column produces a
+	// three-character separator and the padding below repeats a negative
+	// count, panicking the request path.
+	for i := range widths {
+		widths[i] = max(widths[i], 3)
+	}
 	var b strings.Builder
 	writeRow := func(cells []string) {
 		b.WriteString("|")
@@ -1008,7 +1015,7 @@ func (t *Table) renderMarkdown(cols int) string {
 	if t.SepRow != nil {
 		sep := make([]string, cols)
 		for i := range sep {
-			w := max(3, widths[i])
+			w := widths[i]
 			left := strings.HasPrefix(strings.TrimSpace(t.SepRow[i]), ":")
 			right := strings.HasSuffix(strings.TrimSpace(t.SepRow[i]), ":")
 			switch {

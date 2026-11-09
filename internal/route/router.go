@@ -374,8 +374,9 @@ func ApplyShapeRedactionWith(src string, reqRedactor *redact.Redactor, opts *tab
 				// u1a2b3@gmail.com back into [TG:EMAIL:1], destroying the
 				// structure the transform exists to preserve. This holds
 				// because text defaults to hash; with text=auto or keep a
-				// raw free-text cell can remain, which is why the gateway
-				// warns at startup when either is combined with apply.
+				// raw free-text cell can remain, which is why apply
+				// refuses to start with either of them (and with a
+				// disabled generalizer) instead of warning.
 				return work, summary
 			}
 			for k, v := range res.Stats {

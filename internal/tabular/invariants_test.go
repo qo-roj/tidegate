@@ -216,3 +216,24 @@ func TestMarkdownAlignmentPreserved(t *testing.T) {
 		t.Errorf("right alignment lost: %q", right)
 	}
 }
+
+// TestNarrowMarkdownDoesNotPanic covers a markdown table whose column is
+// narrower than a separator cell (three dashes). Padding used to repeat a
+// negative count and panic the request path in both apply and shadow mode.
+func TestNarrowMarkdownDoesNotPanic(t *testing.T) {
+	src := `| mail | ok |
+|------|----|
+| a@b.com | y |
+| c@d.org | n |
+| e@f.net | y |
+`
+	res := Generalize(src, Options{Salt: "s"})
+	if !res.Applied {
+		t.Fatal("expected table")
+	}
+	for _, line := range strings.Split(strings.TrimRight(res.Source, "\n"), "\n") {
+		if !strings.HasPrefix(line, "|") || !strings.HasSuffix(line, "|") {
+			t.Errorf("malformed markdown row: %q", line)
+		}
+	}
+}

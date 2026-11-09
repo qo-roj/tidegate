@@ -109,6 +109,9 @@ func LoadOrCreateSalt(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("tabular salt path is empty")
 	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("tabular salt path must be absolute, got %q", path)
+	}
 
 	if salt, err := readSalt(path); err == nil {
 		return salt, nil
@@ -116,14 +119,20 @@ func LoadOrCreateSalt(path string) (string, error) {
 		return "", err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("creating salt directory: %w", err)
-	}
-	// Tighten only a directory we just created. Chmod-ing an arbitrary
-	// existing directory (say /etc) would be a surprise.
-	if info, err := os.Stat(filepath.Dir(path)); err == nil && info.Mode().Perm()&0o077 != 0 {
-		if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
-			return "", fmt.Errorf("tightening salt directory: %w", err)
+	// Create the directory 0700 only when it does not exist. An existing
+	// directory belongs to the user: silently chmod-ing it (say /etc, if the
+	// salt is configured there) would be a surprise.
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("checking salt directory: %w", err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", fmt.Errorf("creating salt directory: %w", err)
+		}
+		// MkdirAll is subject to umask; make the mode explicit.
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", fmt.Errorf("setting salt directory mode: %w", err)
 		}
 	}
 	buf := make([]byte, SaltSize)
