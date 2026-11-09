@@ -50,7 +50,11 @@ type Options struct {
 	// free-text column is treated as categorical and labelled. Above it,
 	// text is kept and left to pattern redaction.
 	MaxCategorical int
-	// Text is "auto" (default), "keep" or "hash".
+	// Text is "hash" (default), "auto" or "keep". Hashing is the default
+	// because it is the only setting under which no raw cell survives, and
+	// the gateway can then skip pattern redaction on generalized tables.
+	// "auto" keeps high-cardinality free text readable at the cost of that
+	// guarantee; "keep" never touches text.
 	Text string
 	// Keep and Drop are header regexes (case-insensitive). Keep non-empty
 	// means only matching columns survive. Dropped columns are removed, so
@@ -64,7 +68,7 @@ type Options struct {
 
 // DefaultOptions is the policy the gateway uses unless configured otherwise.
 func DefaultOptions() Options {
-	return Options{MinRows: 3, SigFigs: 2, MaxCategorical: 200, Text: "auto"}
+	return Options{MinRows: 3, SigFigs: 2, MaxCategorical: 200, Text: "hash"}
 }
 
 func (o Options) withDefaults() Options {

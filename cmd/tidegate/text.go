@@ -12,6 +12,7 @@ import (
 	"github.com/qo-roj/tidegate/internal/config"
 	"github.com/qo-roj/tidegate/internal/redact"
 	"github.com/qo-roj/tidegate/internal/route"
+	"github.com/qo-roj/tidegate/internal/tabular"
 )
 
 // cmdText redacts free-form text: arguments, a file, or stdin. Output is
@@ -87,7 +88,13 @@ Redacts sensitive data (IPs, emails, keys...) so it is safe to paste anywhere.`)
 	redactor := router.NewRedactor()
 	defer redactor.Clear()
 
-	result, s := runText(content, redactor)
+	tabOpts, tabMode, err := tabularOptions(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading tabular salt: %v\n", err)
+		os.Exit(1)
+	}
+
+	result, s := runTextWith(content, redactor, tabOpts, tabMode)
 
 	if err := writeTextOutput(result, *out); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing output: %v\n", err)
@@ -123,7 +130,14 @@ func splitTextArgs(positionals []string) (text []string, flagAfterText string) {
 // normalization (one trailing newline) happens in the output layer so that
 // --out files preserve the input's exact newline state.
 func runText(content string, r *redact.Redactor) (string, redact.Summary) {
-	return route.ApplyShapeRedaction(content, r)
+	return runTextWith(content, r, nil, tabular.ModeOff)
+}
+
+// runTextWith is runText with the configured table-generalization policy.
+// The CLI honours the gateway's mode: shadow shows the original text and
+// reports what would have changed, apply rewrites it.
+func runTextWith(content string, r *redact.Redactor, opts *tabular.Options, mode tabular.Mode) (string, redact.Summary) {
+	return route.ApplyShapeRedactionWith(content, r, opts, mode)
 }
 
 // ensureTrailingNewline returns s with exactly one terminal newline, for
@@ -185,13 +199,31 @@ func samePath(a, b string) bool {
 
 // printTextSummary prints a compact "what was redacted" listing to w.
 func printTextSummary(w io.Writer, s redact.Summary) {
-	if s.Total() == 0 {
-		fmt.Fprintln(w, "no redactions")
-		return
+	// Table-generalization counters share the summary map but are not
+	// redactions: a generalized cell is rewritten, not replaced by a token.
+	redactions := redact.Summary{}
+	tabular := redact.Summary{}
+	for name, n := range s {
+		if strings.HasPrefix(name, "tabular_") || strings.HasPrefix(name, "shadow_tabular_") {
+			tabular[name] = n
+			continue
+		}
+		redactions[name] = n
 	}
-	fmt.Fprintf(w, "%d redactions\n", s.Total())
-	for _, name := range sortedSummaryNames(s) {
-		fmt.Fprintf(w, "  %s: %d\n", name, s[name])
+
+	if redactions.Total() == 0 {
+		fmt.Fprintln(w, "no redactions")
+	} else {
+		fmt.Fprintf(w, "%d redactions\n", redactions.Total())
+		for _, name := range sortedSummaryNames(redactions) {
+			fmt.Fprintf(w, "  %s: %d\n", name, redactions[name])
+		}
+	}
+	if len(tabular) > 0 {
+		fmt.Fprintln(w, "table generalization")
+		for _, name := range sortedSummaryNames(tabular) {
+			fmt.Fprintf(w, "  %s: %d\n", name, tabular[name])
+		}
 	}
 }
 

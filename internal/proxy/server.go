@@ -279,6 +279,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if s.Metrics != nil && ctx != nil {
 		s.Metrics.ObserveTiers(ctx.Tiers)
 		s.Metrics.ObserveRedactions(ctx.Summary)
+		s.Metrics.ObserveTabularBlocks(ctx.Summary)
 		s.Metrics.AddCacheHits(ctx.CacheHits)
 	}
 

@@ -32,6 +32,15 @@ type Registry struct {
 	upstreamErrors  int64
 	cacheHits       int64
 
+	// tabularBlocks counts table-shaped blocks, by policy mode. "shadow"
+	// blocks were measured but forwarded unchanged; only "apply" blocks
+	// were rewritten.
+	tabularBlocks map[string]int64
+	// tabularCells counts generalized cells by mode and kind. Kept out of
+	// the redactions counter: a generalized cell is not a redaction, and
+	// mixing them would inflate the headline leak count.
+	tabularCells map[tabularCell]int64
+
 	// vaultStats is optional; when set, /metrics includes live vault gauges.
 	vaultStats func() (tokens, cached int64, err error)
 }
@@ -41,13 +50,26 @@ type agentProvider struct {
 	provider string
 }
 
+type tabularCell struct {
+	mode string
+	kind string
+}
+
+// isTabularStat reports whether a summary key belongs to table
+// generalization rather than to value redaction.
+func isTabularStat(name string) bool {
+	return strings.HasPrefix(name, "tabular_") || strings.HasPrefix(name, "shadow_tabular_")
+}
+
 // New creates an empty registry.
 func New() *Registry {
 	return &Registry{
-		start:      time.Now(),
-		requests:   map[agentProvider]int64{},
-		redactions: map[string]int64{},
-		tiers:      map[string]int64{},
+		start:         time.Now(),
+		requests:      map[agentProvider]int64{},
+		redactions:    map[string]int64{},
+		tiers:         map[string]int64{},
+		tabularBlocks: map[string]int64{},
+		tabularCells:  map[tabularCell]int64{},
 	}
 }
 
@@ -85,7 +107,42 @@ func (m *Registry) ObserveRedactions(summary map[string]int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for name, n := range summary {
+		if isTabularStat(name) {
+			continue
+		}
 		m.redactions[name] += int64(n)
+	}
+}
+
+// ObserveTabularBlocks records table-shaped blocks by policy mode ("shadow"
+// or "apply"). Shadow counts are the rollout signal: they say how much would
+// have been rewritten without rewriting anything.
+func (m *Registry) ObserveTabularBlocks(summary map[string]int) {
+	if len(summary) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n := summary["tabular_blocks"]; n > 0 {
+		m.tabularBlocks["apply"] += int64(n)
+	}
+	if n := summary["shadow_tabular_blocks"]; n > 0 {
+		m.tabularBlocks["shadow"] += int64(n)
+	}
+	for name, n := range summary {
+		mode, kind := "", ""
+		switch {
+		case strings.HasPrefix(name, "shadow_tabular_"):
+			mode, kind = "shadow", strings.TrimPrefix(name, "shadow_tabular_")
+		case strings.HasPrefix(name, "tabular_"):
+			mode, kind = "apply", strings.TrimPrefix(name, "tabular_")
+		default:
+			continue
+		}
+		if kind == "blocks" || n == 0 {
+			continue
+		}
+		m.tabularCells[tabularCell{mode: mode, kind: kind}] += int64(n)
 	}
 }
 
@@ -180,6 +237,33 @@ func (m *Registry) writePrometheus(w http.ResponseWriter) {
 		}
 	})
 
+	writeMetric(&b, "tidegate_tabular_blocks_total", "counter", "Table-shaped blocks by policy mode (shadow = measured only).", func() {
+		modes := make([]string, 0, len(m.tabularBlocks))
+		for mode := range m.tabularBlocks {
+			modes = append(modes, mode)
+		}
+		sort.Strings(modes)
+		for _, mode := range modes {
+			fmt.Fprintf(&b, "tidegate_tabular_blocks_total{mode=%q} %d\n", mode, m.tabularBlocks[mode])
+		}
+	})
+
+	writeMetric(&b, "tidegate_tabular_cells_total", "counter", "Cells rewritten by table generalization, by mode and kind.", func() {
+		keys := make([]tabularCell, 0, len(m.tabularCells))
+		for k := range m.tabularCells {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].mode != keys[j].mode {
+				return keys[i].mode < keys[j].mode
+			}
+			return keys[i].kind < keys[j].kind
+		})
+		for _, k := range keys {
+			fmt.Fprintf(&b, "tidegate_tabular_cells_total{mode=%q,kind=%q} %d\n", k.mode, k.kind, m.tabularCells[k])
+		}
+	})
+
 	writeSimple(&b, "tidegate_requests_blocked_total", "counter", "Requests containing blocked content.", m.blockedRequests)
 	writeSimple(&b, "tidegate_blocks_blocked_total", "counter", "Individual content blocks blocked.", m.blockedBlocks)
 	writeSimple(&b, "tidegate_fail_closed_total", "counter", "Requests refused because processing failed.", m.failClosed)
@@ -218,6 +302,8 @@ type statsJSON struct {
 	FailClosed        int64            `json:"fail_closed"`
 	UpstreamErrors    int64            `json:"upstream_errors"`
 	CacheHits         int64            `json:"redaction_cache_hits"`
+	TabularBlocks     map[string]int64 `json:"tabular_blocks"`
+	TabularCells      map[string]int64 `json:"tabular_cells"`
 	VaultTokens       int64            `json:"vault_tokens"`
 	VaultCacheEntries int64            `json:"vault_cache_entries"`
 }
@@ -236,6 +322,8 @@ func (m *Registry) writeJSON(w http.ResponseWriter) {
 		FailClosed:      m.failClosed,
 		UpstreamErrors:  m.upstreamErrors,
 		CacheHits:       m.cacheHits,
+		TabularBlocks:   map[string]int64{},
+		TabularCells:    map[string]int64{},
 	}
 	for k, v := range m.requests {
 		out.Requests[k.agent+"/"+k.provider] = v
@@ -245,6 +333,12 @@ func (m *Registry) writeJSON(w http.ResponseWriter) {
 	}
 	for k, v := range m.tiers {
 		out.Tiers[k] = v
+	}
+	for k, v := range m.tabularBlocks {
+		out.TabularBlocks[k] = v
+	}
+	for k, v := range m.tabularCells {
+		out.TabularCells[k.mode+"/"+k.kind] = v
 	}
 	if m.vaultStats != nil {
 		if tokens, cached, err := m.vaultStats(); err == nil {

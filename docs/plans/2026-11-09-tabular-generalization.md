@@ -1,7 +1,10 @@
 # Tabular generalization — spike and wiring plan
 
-Status: spike implemented on `feat/tabular-generalization` (package compiles,
-13 tests pass, full suite green). Gateway wiring not started.
+Status: implemented on `feat/tabular-generalization`. Package, config,
+router wiring, metrics, CLI parity and presets are done; full suite green
+under `-race`. Two decisions changed during implementation, both recorded
+below: the default text policy became `hash`, and pattern redaction is
+skipped for generalized blocks.
 
 ## Why
 
@@ -183,3 +186,23 @@ data says the transform is worth having.
   that row may still be sensitive. Consider generalizing any table with ≥1
   row when the header policy marks it personal — at the cost of mangling
   one-line CSV payloads.
+
+## Implementation notes (post-spike)
+
+Three things changed from the sketch above, all recorded in the code comments:
+
+1. **Default `text` is `hash`, not `auto`.** Skipping pattern redaction on a
+   generalized block is only safe if no raw cell survives, and `auto` leaves
+   high-cardinality free text in place. `auto` and `keep` remain available for
+   readability, with a startup warning when combined with `apply`.
+2. **Pattern redaction is skipped for generalized blocks** (apply mode only).
+   Running it afterwards re-tokenized every label. Shadow mode is unaffected.
+3. **Presets are embedded from a copy**, `internal/config/rules/`, because
+   `go:embed` cannot reference a parent directory. `rules/` at the repo root is
+   the documented source. `TestEmbeddedRulesMatchSourceTree` now fails the
+   build when the two drift — they had silently diverged before this work.
+
+Also added: `tidegate_tabular_cells_total{mode,kind}` and tabular counters
+excluded from `tidegate_redactions_total` (a generalized cell is not a
+redaction), plus the redaction-cache fingerprint now includes the tabular
+policy so a salt or threshold change cannot serve stale output.

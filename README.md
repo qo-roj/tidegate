@@ -73,6 +73,7 @@ Agent ──▶ Tidegate (localhost:8842) ──▶ ┌── Cloud API (scrubbe
 
 - **Gateway mode** — run one Tidegate on a server/Raspberry Pi for the whole LAN (`--bind 0.0.0.0` + client keys); any-OS clients just point their base URL at it, no local install — see [Gateway Mode](docs/gateway-mode.md)
 - **Session-scoped token vault** — tokens stay stable across a conversation, so a value redacted in turn 1 is still `[TG:IP:1]` in turn 5 and always resolves to the same original; mappings are per-conversation, persisted locally, and expire (default 24h) — see [Sessions](docs/sessions.md)
+- **Table generalization** — CSV, TSV, `psql`-style and markdown tables leave as data-shaped stand-ins: same columns, types, row count, grouping keys and time intervals, no real values; `shadow` by default — see [Table generalization](docs/tabular.md)
 - **Content-aware redaction** — JSON bodies are scanned for sensitive keys (`password`, `api_key`, `authorization`, DSNs), catching secrets no regex recognises; log timestamps are shielded before pattern matching so phone/date patterns cannot eat them
 - **`tidegate wrap` / `unwrap`** — point Claude Code, Codex, or OpenCode at the gateway in one command, and undo it exactly — see [Wrap](docs/wrap.md)
 - **Metrics** — Prometheus `/metrics` + JSON `/stats` on `127.0.0.1:9116`: requests, tiers, redactions by pattern, blocks, fail-closed events, cache hits, vault size — see [Metrics](docs/metrics.md)

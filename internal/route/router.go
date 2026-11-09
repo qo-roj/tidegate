@@ -16,6 +16,7 @@ import (
 	"github.com/qo-roj/tidegate/internal/ollama"
 	"github.com/qo-roj/tidegate/internal/redact"
 	"github.com/qo-roj/tidegate/internal/rules"
+	"github.com/qo-roj/tidegate/internal/tabular"
 	"github.com/qo-roj/tidegate/internal/vault"
 )
 
@@ -48,14 +49,22 @@ type Router struct {
 	// and enables delta-only processing.
 	Vault *vault.Vault
 
+	// Tabular, when set, enables table generalization (see the tabular
+	// package). Nil means tables are forwarded untouched.
+	Tabular *tabular.Options
+	// TabularMode selects shadow (measure only) or apply (rewrite).
+	TabularMode tabular.Mode
+
 	// enabledPatterns is the resolved [redaction.patterns] set (nil → all
 	// default patterns, matching pre-toggle behavior).
 	enabledPatterns []string
 
 	// rulesetFingerprint identifies the active pattern set (names and
 	// regexes) in the redaction cache, so a config or regex change never
-	// reuses stale output.
+	// reuses stale output. cacheBase is the same value before tabular
+	// options are folded in.
 	rulesetFingerprint string
+	cacheBase          string
 }
 
 // New creates a Router with all dependencies wired.
@@ -81,13 +90,33 @@ func New(rs *rules.RuleSet, ollamaClient *ollama.Client, auditLog *audit.Log) *R
 			}
 		}
 	}
-	r.rulesetFingerprint = "redaction-v2-" + redact.Fingerprint(r.enabledPatterns)
+	r.cacheBase = "redaction-v2-" + redact.Fingerprint(r.enabledPatterns)
+	r.rulesetFingerprint = r.cacheBase
 	return r
 }
 
 // WithVault attaches a session vault. Returns the router for chaining.
 func (r *Router) WithVault(v *vault.Vault) *Router {
 	r.Vault = v
+	return r
+}
+
+// WithTabular enables table generalization. ModeOff is a no-op. The policy
+// fingerprint joins the redaction cache key, so changing the salt, the
+// thresholds or the column lists never serves output produced under the old
+// settings. Returns the router for chaining.
+func (r *Router) WithTabular(opts tabular.Options, mode tabular.Mode) *Router {
+	if mode == tabular.ModeOff {
+		return r
+	}
+	o := opts
+	r.Tabular = &o
+	r.TabularMode = mode
+	base := r.cacheBase
+	if base == "" {
+		base = r.rulesetFingerprint
+	}
+	r.rulesetFingerprint = base + "-tab-" + o.Fingerprint() + "-" + mode.String()
 	return r
 }
 
@@ -294,13 +323,31 @@ func (r *Router) ProcessRequestSession(body []byte, agent string, provider, sess
 // ApplyShapeRedaction applies Tidegate's shape-aware redaction to one block:
 // JSON sensitive keys first, then patterns over timestamp-shielded text.
 // Exported so one-off surfaces (tidegate text) share the proxy's behaviour.
+// Table generalization is off on this path; use ApplyShapeRedactionWith to
+// enable it.
 func ApplyShapeRedaction(src string, reqRedactor *redact.Redactor) (string, redact.Summary) {
+	return ApplyShapeRedactionWith(src, reqRedactor, nil, tabular.ModeOff)
+}
+
+// ApplyShapeRedactionWith is ApplyShapeRedaction plus table generalization.
+//
+// Order matters. JSON key redaction runs first so secrets are caught by key
+// before anything reshapes the document. Generalization runs next, on the
+// original spelling of the values, because pattern redaction would already
+// have turned an email into [TG:EMAIL:1] and destroyed type inference.
+// Pattern redaction runs last so text left in place by the text policy (and
+// cells below the inference threshold) still get pattern coverage.
+//
+// In shadow mode the block is classified and generalized, the counters are
+// merged into the summary, and the original bytes are forwarded.
+func ApplyShapeRedactionWith(src string, reqRedactor *redact.Redactor, opts *tabular.Options, mode tabular.Mode) (string, redact.Summary) {
 	summary := redact.Summary{}
+	work := src
+	kind := content.Detect(src)
 
 	// JSON key redaction runs on the raw document so the vault stores the
 	// real value, never a timestamp sentinel.
-	work := src
-	if content.Detect(src) == content.KindJSON {
+	if kind == content.KindJSON {
 		// "\/" is a legal JSON spelling of "/"; patterns expect the plain
 		// form (e.g. url_hostname needs "://"). Semantics are unchanged.
 		work = strings.ReplaceAll(work, `\/`, "/")
@@ -310,6 +357,31 @@ func ApplyShapeRedaction(src string, reqRedactor *redact.Redactor) (string, reda
 		})
 		if n > 0 {
 			summary["json_secret"] = n
+		}
+	}
+
+	if opts != nil && mode != tabular.ModeOff && kind != content.KindJSON {
+		if res := tabular.Generalize(work, *opts); res.Applied {
+			if mode == tabular.ModeApply {
+				work = res.Source
+				for k, v := range res.Stats {
+					summary[k] += v
+				}
+				summary["tabular_blocks"]++
+				// Generalized tables skip pattern redaction. Every cell is
+				// now a label, a rounded number, a shifted date or a bool,
+				// and running the PII patterns over them would only turn
+				// u1a2b3@gmail.com back into [TG:EMAIL:1], destroying the
+				// structure the transform exists to preserve. This holds
+				// because text defaults to hash; with text=auto or keep a
+				// raw free-text cell can remain, which is why the gateway
+				// warns at startup when either is combined with apply.
+				return work, summary
+			}
+			for k, v := range res.Stats {
+				summary["shadow_"+k] += v
+			}
+			summary["shadow_tabular_blocks"]++
 		}
 	}
 
@@ -340,7 +412,7 @@ func (r *Router) redactContent(ctx *RequestContext, reqRedactor *redact.Redactor
 		}
 	}
 
-	out, summary := ApplyShapeRedaction(src, reqRedactor)
+	out, summary := ApplyShapeRedactionWith(src, reqRedactor, r.Tabular, r.TabularMode)
 
 	if r.Vault != nil && ctx.Session != "" && cacheKey != "" {
 		if sumJSON, err := json.Marshal(summary); err == nil {

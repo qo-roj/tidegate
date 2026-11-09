@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/qo-roj/tidegate/internal/rules"
+	"github.com/qo-roj/tidegate/internal/tabular"
 )
 
 //go:embed rules/defaults.conf
@@ -70,14 +71,52 @@ type Local struct {
 	OllamaModel string
 }
 
+// Tabular holds the table-generalization policy ([tabular] section).
+// Settings are only used when Mode is not "off"; the gateway defaults to
+// "shadow" so the transform can be judged on real traffic before it rewrites
+// anything.
+type Tabular struct {
+	Mode           string // off | shadow | apply
+	MinRows        int
+	SigFigs        int
+	MaxCategorical int
+	Text           string // hash (default) | auto | keep
+	SaltFile       string
+	Keep           []string
+	Drop           []string
+	Disable        []string
+}
+
 // AppConfig is the fully resolved configuration.
 type AppConfig struct {
 	Gateway Gateway
 	Cloud   Cloud
 	Local   Local
+	Tabular Tabular
 	Clients []Client // gateway-mode clients, in config order
 	RuleSet *rules.RuleSet
 }
+
+// Options converts the config section into tabular options. The salt is not
+// read here: the caller loads it once, because it touches the filesystem.
+func (t Tabular) Options() tabular.Options {
+	disable := make(map[string]bool, len(t.Disable))
+	for _, name := range t.Disable {
+		disable[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	return tabular.Options{
+		MinRows:        t.MinRows,
+		SigFigs:        t.SigFigs,
+		MaxCategorical: t.MaxCategorical,
+		Text:           t.Text,
+		Keep:           t.Keep,
+		Drop:           t.Drop,
+		Disable:        disable,
+	}
+}
+
+// ParsedMode is the tabular mode as a Mode value.
+func (t Tabular) ParsedMode() tabular.Mode { return tabular.ParseMode(t.Mode) }
 
 // Load resolves configuration from all sources in order:
 //  1. Built-in defaults (embedded in binary)
@@ -87,6 +126,7 @@ type AppConfig struct {
 //  4. Project-local config (./.tidegate.conf)
 //  5. CLI flags (passed as params)
 func Load(cliPort int, cliPreset string) (*AppConfig, error) {
+	home, _ := os.UserHomeDir()
 	cfg := &AppConfig{
 		Gateway: Gateway{
 			Port:        8842,
@@ -99,6 +139,14 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 		Local: Local{
 			OllamaURL:   "http://localhost:11434",
 			OllamaModel: "llama3:8b",
+		},
+		Tabular: Tabular{
+			Mode:           "shadow",
+			MinRows:        3,
+			SigFigs:        2,
+			MaxCategorical: 200,
+			Text:           "hash",
+			SaltFile:       filepath.Join(home, ".config", "tidegate", "tabular.salt"),
 		},
 	}
 
@@ -119,7 +167,6 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	if cliPreset != "" {
 		presetChoice = cliPreset
 	}
-	home, _ := os.UserHomeDir()
 	userConfigPath := filepath.Join(home, ".config", "tidegate", "tidegate.conf")
 	var userCfg, projCfg *rules.Config
 	if fileExists(userConfigPath) {
@@ -148,6 +195,11 @@ func Load(cliPort int, cliPreset string) (*AppConfig, error) {
 	presetData, err := loadPreset(cfg.Gateway.Preset)
 	if err != nil {
 		return nil, fmt.Errorf("loading preset %s: %w", cfg.Gateway.Preset, err)
+	}
+	// Presets carry [gateway]/[local]/[tabular] settings as well as rules.
+	// They are applied before user and project files so both can override.
+	if presetData != nil {
+		applyGatewayBytes(cfg, presetData)
 	}
 
 	// Build the ordered layer list: defaults → preset → user → project.
@@ -237,6 +289,12 @@ func applyGatewayFile(cfg *AppConfig, path string) {
 	if err != nil {
 		return
 	}
+	applyGatewayBytes(cfg, data)
+}
+
+// applyGatewayBytes is applyGatewayFile for config bytes that are already in
+// memory (embedded presets).
+func applyGatewayBytes(cfg *AppConfig, data []byte) {
 	section := ""
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
@@ -292,8 +350,47 @@ func applyGatewayFile(cfg *AppConfig, path string) {
 			case "ollama_model":
 				cfg.Local.OllamaModel = v
 			}
+		case "tabular":
+			switch k {
+			case "mode":
+				cfg.Tabular.Mode = strings.ToLower(v)
+			case "min_rows":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.Tabular.MinRows = n
+				}
+			case "sig_figs":
+				if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 8 {
+					cfg.Tabular.SigFigs = n
+				}
+			case "max_categorical":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.Tabular.MaxCategorical = n
+				}
+			case "text":
+				cfg.Tabular.Text = strings.ToLower(v)
+			case "salt_file":
+				cfg.Tabular.SaltFile = v
+			case "keep":
+				cfg.Tabular.Keep = splitCSVList(v)
+			case "drop":
+				cfg.Tabular.Drop = splitCSVList(v)
+			case "disable":
+				cfg.Tabular.Disable = splitCSVList(v)
+			}
 		}
 	}
+}
+
+// splitCSVList parses a comma-separated config value into trimmed entries.
+// Empty entries are dropped, so "a, ,b" is [a b] rather than three items.
+func splitCSVList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // stripHashComment removes a trailing " #..." comment from a value.
