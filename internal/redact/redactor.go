@@ -50,6 +50,15 @@ type Pattern struct {
 	// readable, while the hostname (group 1) is redacted. Go's RE2 has no
 	// lookbehind, so group-span replacement is the only way to express this.
 	Group int
+	// Validate, when non-nil, is called with the candidate span (the whole
+	// match, or the capture-group span when Group > 0) before it is
+	// tokenized. A match that fails validation passes through untouched.
+	// Used for check-digit formats — Luhn on credit_card — so a 16-digit
+	// order number is not taken for a PAN. No real PAN fails its own
+	// checksum, so validation only removes false positives, never true
+	// positives. When Validate is set, failed matches are NOT counted in
+	// the Redact summary.
+	Validate func(match string) bool
 }
 
 // TokenStore is the persistence backend for session-scoped token mappings.
@@ -197,12 +206,18 @@ func (r *Redactor) Redact(content string) (string, Summary) {
 					return match // group didn't participate — leave untouched
 				}
 				value := match[start:end]
+				if p.Validate != nil && !p.Validate(value) {
+					return match // check-digit format failed — leave untouched
+				}
 				token := r.allocateToken(p, value)
 				matchCount++
 				return match[:start] + token + match[end:]
 			})
 		} else {
 			result = p.Regex.ReplaceAllStringFunc(result, func(match string) string {
+				if p.Validate != nil && !p.Validate(match) {
+					return match // check-digit format failed (e.g. non-Luhn 16-digit order ID)
+				}
 				matchCount++
 				return r.allocateToken(p, match)
 			})

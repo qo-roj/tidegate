@@ -232,3 +232,82 @@ func TestRedactJSONKeysPreservesOtherTypes(t *testing.T) {
 		t.Fatalf("n=%d out=%s", n, out)
 	}
 }
+
+// TestShieldClockGuardKeepsMACsAndIPv6: the clockStamp guard (2026-11-21)
+// must leave hex-pair runs intact so mac_address/ipv6 can fire on the full
+// span, while clean three-pair clocks are still shielded.
+func TestShieldClockGuardKeepsMACsAndIPv6(t *testing.T) {
+	cases := []struct {
+		name  string
+		src   string
+		want  int // expected summary count for the pattern named below
+		patty string
+	}{
+		{"mac_digit_tail", "device mac 02:42:ac:11:00:03 up", 1, "mac_address"},
+		{"mac_all_digit_pairs", "adapter 11:22:33:44:55:66 up", 1, "mac_address"},
+		{"ipv6_two_digit_groups", "tunnel 12:34:56:78:9a:bc:de:f0 up", 1, "ipv6"},
+	}
+	for _, c := range cases {
+		shielded, restore := content.ShieldTimestamps(c.src)
+		redacted, summary := redact.New().Redact(shielded)
+		out := restore(redacted)
+		if summary[c.patty] != c.want {
+			t.Errorf("[%s] %s fired %d times, want %d (shielded=%q)",
+				c.name, c.patty, summary[c.patty], c.want, shielded)
+		}
+		_ = out
+		if c.name == "mac_digit_tail" && strings.Contains(out, "02:42:ac:11:00:03") {
+			t.Errorf("[%s] MAC survived raw: %q", c.name, out)
+		}
+	}
+
+	// A clean clock is still shielded: the phone pattern must not see it.
+	line := "job ran 10:15:23 and finished"
+	shielded, restore := content.ShieldTimestamps(line)
+	redacted, summary := redact.New().Redact(shielded)
+	if summary["phone"] != 0 {
+		t.Errorf("phone fired on a clean clock: %v (shielded=%q)", summary, shielded)
+	}
+	if got := restore(redacted); got != line {
+		t.Errorf("clean clock line changed: %q", got)
+	}
+}
+
+// TestShieldIntermediatePreservesStructure (Krabs round 1, C2): patterns
+// evaluate the SHIELDED intermediate, so the clock guard must not swallow
+// the leading guard char into the sentinel — a consumed newline would merge
+// lines and break every (?m)^-anchored pattern on the next line, and a
+// consumed quote/bracket would mangle JSON-shaped spans. The guard prefix
+// is re-emitted in place; only the clock itself is stored for restore.
+func TestShieldIntermediatePreservesStructure(t *testing.T) {
+	// 1. A clock at line start does not eat the preceding newline.
+	multi := "alpha ends here\n10:15:23 task ran\nNov 21 10:16:45 webserver01 sshd[99]: x"
+	shielded, restore := content.ShieldTimestamps(multi)
+	if got := strings.Count(shielded, "\n"); got != 2 {
+		t.Errorf("intermediate line count = %d, want 3 lines (newline eaten): %q", got+1, shielded)
+	}
+	if ok := restore(shielded); ok != multi {
+		t.Errorf("round-trip changed: %q", ok)
+	}
+
+	// 2. A clock inside a JSON string keeps its opening quote: the
+	// intermediate stays valid JSON.
+	js := `{"time": "10:15:23", "note": "x"}`
+	shielded, restore = content.ShieldTimestamps(js)
+	if !json.Valid([]byte(shielded)) {
+		t.Errorf("shielded intermediate is not valid JSON: %q", shielded)
+	}
+	if got := restore(shielded); got != js {
+		t.Errorf("JSON round-trip changed: %q", got)
+	}
+
+	// 3. A clock inside a bracket keeps the bracket.
+	br := "event [10:15:23] fired"
+	shielded, restore = content.ShieldTimestamps(br)
+	if !strings.Contains(shielded, "[") || !strings.Contains(shielded, "]") {
+		t.Errorf("bracket lost in intermediate: %q", shielded)
+	}
+	if got := restore(shielded); got != br {
+		t.Errorf("bracket round-trip changed: %q", got)
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Kind is a detected content shape.
@@ -33,10 +34,31 @@ const (
 )
 
 var (
-	isoTimestamp  = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
-	apacheStamp   = regexp.MustCompile(`\b\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2}(?: [+-]\d{4})?\b`)
-	syslogStamp   = regexp.MustCompile(`\b[A-Z][a-z]{2} {1,2}\d{1,2} \d{2}:\d{2}:\d{2}\b`)
-	clockStamp    = regexp.MustCompile(`\b\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?\b`)
+	isoTimestamp = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
+	apacheStamp  = regexp.MustCompile(`\b\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2}(?: [+-]\d{4})?\b`)
+	syslogStamp  = regexp.MustCompile(`\b[A-Z][a-z]{2} {1,2}\d{1,2} \d{2}:\d{2}:\d{2}\b`)
+	// clockStamp guards against digit-pair runs longer than a clock: a MAC
+	// tail (`02:42:ac:11:00:03`) or a 2-digit-group IPv6 (`12:34:56:78:…`)
+	// contains a `\d{2}:\d{2}:\d{2}` shape, and shielding it broke the
+	// mac_address/ipv6 patterns mid-span (found by the privacy meter,
+	// 2026-11-21). The leading guard (`^|[^:\w\n\r]`) rejects a match
+	// preceded by `:`, a word char or a newline: mid-run (MAC) positions
+	// never match, and a clock at line start is taken by the zero-width `^`
+	// so the preceding newline survives the SHIELDED intermediate (a
+	// swallowed newline would merge lines and break every (?m)^-anchored
+	// pattern on the next line — Krabs review round 1, 2026-11-21). The
+	// trailing `(?::[0-9a-fA-F]{2})*` consumes any further hex pairs, and
+	// the shield callback then decides: a match with more than two colons
+	// is a longer colon-run (IPv6-style), returned UNCHANGED; a clean
+	// three-pair clock becomes a sentinel. Go RE2 has no lookahead, so
+	// the trailing context must be consumed and classified rather than
+	// tested. A clock glued to further hex pairs (`10:15:23:ab:cd:ef`) is
+	// classified as a run and left in place — nothing in the pattern set
+	// can eat that shape, so the clock riding along is harmless.
+	// Known tradeoff: a real clock embedded in a longer colon-run is not
+	// shielded (documented, accepted — shields exist to protect the clock
+	// FROM patterns, and no pattern matches it inside a run).
+	clockStamp    = regexp.MustCompile(`(?m)(?:^|[^:\w\n\r])\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?::[0-9a-fA-F]{2})*`)
 	dateOnlyStamp = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}\b`)
 
 	logLine   = regexp.MustCompile(`(?m)^(?:[^\n]{0,140}(?:\[\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2}|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|\b[A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2}|\b\d{2}:\d{2}:\d{2}[.,]\d+)|(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL|NOTICE)\b)`)
@@ -86,14 +108,25 @@ func Detect(s string) Kind {
 	return KindText
 }
 
-// sensitiveKeys are compared after lowercasing and removing "_" and "-".
+// sensitiveKeys are compared after lowercasing and removing "_", "-" and ".".
+//
+// Selection rule (v0.8.0): a key belongs here only when its value is
+// sensitive BY CONVENTION in every realistic use — a field named cvv is a
+// card verification code, a field named password is a password, whatever the
+// bytes inside look like. Keys whose value is routinely NOT sensitive (name,
+// phone, email, pin — GPIO pin numbers, person names in schema discussions)
+// stay OUT: the shape patterns own those, and wholesale replacement would
+// destroy data the agent legitimately works with. This mirrors Penteos's
+// field-name masking layer (penteos.com, AGPL-3.0) — the idea, not the code.
 var sensitiveKeys = map[string]bool{
 	"password":           true,
 	"passwd":             true,
+	"pwd":                true,
 	"passphrase":         true,
 	"secret":             true,
 	"clientsecret":       true,
 	"secretkey":          true,
+	"apisecret":          true,
 	"apikey":             true,
 	"accesstoken":        true,
 	"refreshtoken":       true,
@@ -116,6 +149,35 @@ var sensitiveKeys = map[string]bool{
 	"dsn":                true,
 	"dsnstring":          true,
 	"jwt":                true,
+	// v0.8.0 — financial: a PAN, CVV or bank account number under its
+	// conventional key is sensitive regardless of the bytes it holds.
+	// "pan" itself stays OUT (Krabs round 1, m2): it fails the selection
+	// rule — recipe JSONs (pan = bread in Spanish), network payloads and
+	// device namespaces all use it non-sensitively. "pannumber" (the
+	// Indian tax ID key) passes the rule and is in.
+	"cvv":                  true,
+	"cvv2":                 true,
+	"cvc":                  true,
+	"cvc2":                 true,
+	"cardverificationcode": true,
+	"cardnumber":           true,
+	"creditcard":           true,
+	"creditcardnumber":     true,
+	"cardno":               true,
+	"pannumber":            true,
+	"iban":                 true,
+	"accountnumber":        true,
+	"bankaccount":          true,
+	"routingnumber":        true,
+	// v0.8.0 — government identifiers under their conventional keys.
+	"ssn":                  true,
+	"socialsecuritynumber": true,
+	"passportnumber":       true,
+	"passportno":           true,
+	// v0.8.0 — header-style keys that appear inside JSON bodies.
+	"xapikey":      true,
+	"xauthtoken":   true,
+	"xaccesstoken": true,
 }
 
 // IsSensitiveKey reports whether a JSON key conventionally holds a secret.
@@ -302,7 +364,34 @@ func ShieldTimestamps(src string) (string, func(string) string) {
 	shield(isoTimestamp)
 	shield(apacheStamp)
 	shield(syslogStamp)
-	shield(clockStamp)
+	// clockStamp matches clean three-pair clocks AND longer hex-pair runs
+	// (MAC/IPv6 fragments — RE2 has no lookahead, so the trailing pairs
+	// are consumed and classified here). Only the clean clock is shielded;
+	// a longer colon-run must survive so mac_address/ipv6 can fire on the
+	// full span (privacy meter regression, 2026-11-21).
+	//
+	// The leading guard char (space, quote, bracket) is RE-EMITTED in
+	// place, not swallowed into the sentinel: patterns evaluate the
+	// shielded intermediate, and a consumed quote or bracket would mangle
+	// JSON-shaped spans there, while a consumed newline would merge lines
+	// and break (?m)^-anchored patterns on the next line (Krabs review
+	// round 1, 2026-11-21). Only the clock itself is stored for restore;
+	// at a line-start match (^ is zero-width) the match begins with a
+	// digit and the prefix is empty.
+	out = clockStamp.ReplaceAllStringFunc(out, func(match string) string {
+		if strings.Count(match, ":") > 2 {
+			return match // MAC/IPv6 fragment, not a clock — leave in place
+		}
+		prefix := ""
+		if match[0] < '0' || match[0] > '9' {
+			_, size := utf8.DecodeRuneInString(match)
+			prefix = match[:size]
+		}
+		key := sentinel(next)
+		next++
+		restore[key] = match[len(prefix):]
+		return prefix + key
+	})
 	shield(dateOnlyStamp)
 
 	if len(restore) == 0 {
