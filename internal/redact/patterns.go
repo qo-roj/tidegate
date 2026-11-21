@@ -102,6 +102,33 @@ func DefaultPatterns() []*Pattern {
 			Enabled:  true,
 		},
 
+		// Database connection strings — MUST run before email: a DSN's
+		// password@host part is email-shaped, and with email first the
+		// email pattern consumed the userinfo while the DSN's scheme,
+		// username and port survived mis-attributed (privacy meter,
+		// 2026-11-21). More specific formats consume their span whole.
+		{
+			Name: "database_connection",
+			// postgresql AND the driver-suffix forms (mongodb+srv is the
+			// modern default; postgresql+psycopg2 / mysql+pymysql are the
+			// SQLAlchemy spellings; mssql/amqp also carry credentials).
+			// RE2 falls through a failed alternative to the next, so
+			// branch ORDER does not matter (probed, Krabs round 1) — the
+			// pre-v0.8.0 bug was the MISSING postgresql alternative
+			// itself, which left the most common spelling unredacted
+			// (privacy meter, 2026-11-21). Driver suffixes are enumerated,
+			// not generalized — a `scheme+driver://` catch-all would eat
+			// non-credential URLs like git+ssh://.
+			Regex: regexp.MustCompile(`\b(?:postgresql\+psycopg2|postgresql|postgres\+psycopg2|postgres|mysql\+pymysql|mysql|mongodb\+srv|mongodb|mssql|amqp|rediss|redis)://[^\s]+`),
+			// [^\s]+ swallows a trailing quote or comma into the span
+			// (`export DSN="postgresql://…"` tokenizes including the
+			// closing quote) — deliberate: greedy whole-token is the
+			// fail-safe direction, and restore returns the exact span.
+			// Cosmetic asymmetry documented (Krabs round 1, m5).
+			Category: "DBURL",
+			Enabled:  true,
+		},
+
 		// Email — specific structure with @
 		{
 			Name:     "email",
@@ -130,20 +157,26 @@ func DefaultPatterns() []*Pattern {
 			Enabled:  true,
 		},
 
-		// Database connection strings
-		{
-			Name:     "database_connection",
-			Regex:    regexp.MustCompile(`\b(?:postgres|mysql|mongodb|redis)://[^\s]+`),
-			Category: "DBURL",
-			Enabled:  true,
-		},
-
-		// Credit card — 13-16 digits with optional separators
+		// Credit card — 13-19 digits with optional separators, Luhn-checked.
+		// Every real PAN carries a valid Luhn checksum; an order ID or
+		// invoice number of the same length does not. The Validate hook
+		// (v0.8.0) passes only Luhn-valid spans, so digit-shaped identifiers
+		// pass through instead of becoming [TG:CC:N] noise. The window
+		// widens to 19 digits (Krabs round 1, M1): real Maestro/UATP PANs
+		// run that long, and with Luhn gating the wider window costs
+		// nothing — a 19-digit order ID fails the checksum and passes
+		// through. 20+ digit runs still never match (the \b after the
+		// window cannot sit mid-run). Known tradeoff, documented: a
+		// single-digit TYPO in a real PAN fails its own checksum and
+		// passes through unredacted — check-digit gating inherits this
+		// from the format itself; only digit-pair transpositions that
+		// keep Luhn valid (e.g. 09↔90) still tokenize.
 		{
 			Name:     "credit_card",
-			Regex:    regexp.MustCompile(`\b(?:\d[ \-]?){13,16}\b`),
+			Regex:    regexp.MustCompile(`\b(?:\d[ \-]?){13,19}\b`),
 			Category: "CC",
 			Enabled:  true,
+			Validate: luhnValid,
 		},
 
 		// US Social Security Numbers
@@ -221,8 +254,15 @@ func ExtendedPatterns() []*Pattern {
 		// deck") lacks that tag and stays untouched. Timestamps, process and
 		// pid all stay readable; only the hostname is tokenized.
 		{
-			Name:     "syslog_hostname",
-			Regex:    regexp.MustCompile(`(?m)^(?:[A-Z][a-z]{2}\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2})\s([a-zA-Z0-9][a-zA-Z0-9._-]*)\s+[a-zA-Z0-9._-]+(?:\[\d+\])?\s*:`),
+			Name: "syslog_hostname",
+			// The timestamp alternatives cover the SHIELDED form too: the
+			// content shield replaces timestamps with \x7f-padded sentinels
+			// BEFORE patterns run, so without the sentinel alternative this
+			// pattern went dead in the gateway pipeline entirely (v0.7.0
+			// regression, found by the privacy meter 2026-11-21). The
+			// unshielded alternatives stay for direct Redactor.Redact paths
+			// (tests, tidegate text without shape detection).
+			Regex:    regexp.MustCompile(`(?m)^(?:[A-Z][a-z]{2}\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2}|\x7f[A-Z]+\x7f)\s([a-zA-Z0-9][a-zA-Z0-9._-]*)\s+[a-zA-Z0-9._-]+(?:\[\d+\])?\s*:`),
 			Category: "HOST",
 			Group:    1,
 			Enabled:  false,
@@ -262,12 +302,25 @@ func ExtendedPatterns() []*Pattern {
 		// IPv6 bracket vhosts (`[2001:db8::1]:443 …`) are out of scope.
 		{
 			Name: "accesslog_hostname",
+			// The bracket alternative accepts the SHIELDED timestamp form:
+			// the content shield replaces the Apache/ISO stamp inside the
+			// brackets with a \x7f sentinel before patterns run, which —
+			// without the sentinel alternative — killed this pattern in the
+			// gateway pipeline and silently undid the v0.6.2 vhost fix
+			// (found by the privacy meter 2026-11-21).
+			// The userid field accepts any token: real logs have logged-in
+			// users (`… - alice [stamp]`), not only `- -` — the original
+			// pattern demanded two dashes and silently skipped any line
+			// with a real userid, leaking that vhost (privacy meter,
+			// 2026-11-21). Identd stays literal `-` (universally dead
+			// protocol) as the structural anchor.
 			Regex: regexp.MustCompile(`(?m)^([a-zA-Z][a-zA-Z0-9._-]*` +
 				`|\d[A-Za-z0-9]*\.[a-zA-Z0-9][a-zA-Z0-9._-]*` +
 				`|\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?` +
-				`[ 	]+\S+[ 	]+-[ 	]+-[ 	]+` +
+				`[ 	]+\S+[ 	]+-[ 	]+\S+[ 	]+` +
 				`\[(?:\d{2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{2}:\d{2}:\d{2}[ 	]?[+-]\d{4}` +
-				`|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)\]`),
+				`|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?` +
+				`|\x7f[A-Z]+\x7f)\]`),
 			Category: "HOST",
 			Group:    1,
 			Enabled:  false,
@@ -308,11 +361,24 @@ func ExtendedPatterns() []*Pattern {
 // patternNames is the registry of every known pattern, in evaluation order.
 // AllPatterns and PatternNames are the single source of truth for what a
 // [redaction.patterns] toggle can reference.
+// Order matters: more specific patterns (API keys, private keys, JWTs,
+// DSNs) run before less specific ones (email, phone, credit card) to
+// prevent greedy matches from consuming substrings of longer formats.
+// database_connection precedes email because a DSN's password@host part
+// is email-shaped (`postgres://user:hunter2@db.internal:5432/prod`) —
+// with email first, the email pattern consumed the userinfo and the
+// DSN's scheme/username/port survived mis-attributed (privacy meter,
+// 2026-11-21). Within the IP family, ipv4_private runs before ipv4 so
+// the private-range toggle is meaningful — when both are enabled,
+// RFC1918 addresses are attributed to ipv4_private and public ones to
+// ipv4 (disabling ipv4_private alone never stops private addresses from
+// being redacted while ipv4 is on; fail-safe direction).
 var patternNames = []string{
-	"private_key", "jwt", "api_key_github", "api_key_openai", "api_key_anthropic",
+	"private_key", "jwt", "database_connection",
+	"api_key_github", "api_key_openai", "api_key_anthropic",
 	"api_key_aws", "api_key_aws_secret", "api_key_google", "api_key_stripe",
 	"api_key_slack", "api_key_gitlab", "bearer_token", "email", "ipv4_private",
-	"ipv4", "ipv6", "mac_address", "database_connection", "credit_card", "ssn_us",
+	"ipv4", "ipv6", "mac_address", "credit_card", "ssn_us",
 	"phone", "hostname_internal", "iban", "passport", "high_entropy_secret",
 	"syslog_hostname", "passwd_username", "accesslog_hostname",
 	"docroot_hostname", "url_hostname",
@@ -373,7 +439,7 @@ func Fingerprint(names []string) string {
 		if len(names) > 0 && !enabled[p.Name] {
 			continue
 		}
-		fmt.Fprintf(h, "%s|%s|%s|%d\n", p.Name, p.Regex.String(), p.Category, p.Group)
+		fmt.Fprintf(h, "%s|%s|%s|%d|%v\n", p.Name, p.Regex.String(), p.Category, p.Group, p.Validate != nil)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:8]
 }
