@@ -47,18 +47,30 @@ var (
 	// so the preceding newline survives the SHIELDED intermediate (a
 	// swallowed newline would merge lines and break every (?m)^-anchored
 	// pattern on the next line — Krabs review round 1, 2026-11-21). The
-	// trailing `(?::[0-9a-fA-F]{2})*` consumes any further hex pairs, and
-	// the shield callback then decides: a match with more than two colons
-	// is a longer colon-run (IPv6-style), returned UNCHANGED; a clean
-	// three-pair clock becomes a sentinel. Go RE2 has no lookahead, so
-	// the trailing context must be consumed and classified rather than
-	// tested. A clock glued to further hex pairs (`10:15:23:ab:cd:ef`) is
-	// classified as a run and left in place — nothing in the pattern set
-	// can eat that shape, so the clock riding along is harmless.
+	// leading guard char (space, quote, bracket) is re-emitted by the
+	// callback, never swallowed into the sentinel.
+	//
+	// The trailing consumption `(?::[0-9a-fA-F]{1,4}|::)*` eats any further
+	// colon-joined hex groups (IPv6 groups run 1-4 digits, not just the 2
+	// MACs use) AND the `::` compression separator. Without the `::`
+	// alternative and the {1,4} width, a valid IPv6 whose first three
+	// groups look like a clock (`12:34:56::1`,
+	// `12:34:56:7:89:ab:cd:ef`) matched only the `12:34:56` prefix,
+	// classified as a CLEAN clock, and got shielded — splitting the
+	// address so ipv6 never fired and the tail groups leaked upstream
+	// (deepseek-v4-pro review round 2, 2026-11-22, probe-confirmed). The
+	// shield callback then decides: a match with more than two colons is
+	// a longer colon-run (MAC/IPv6-style), returned UNCHANGED so
+	// mac_address/ipv6 can fire on the full span; a clean three-pair
+	// clock becomes a sentinel. Go RE2 has no lookahead, so the trailing
+	// context must be consumed and classified rather than tested. A clock
+	// glued to further hex pairs (`10:15:23:ab:cd:ef`) is classified as
+	// a run and left in place — nothing in the pattern set can eat that
+	// shape, so the clock riding along is harmless.
 	// Known tradeoff: a real clock embedded in a longer colon-run is not
 	// shielded (documented, accepted — shields exist to protect the clock
 	// FROM patterns, and no pattern matches it inside a run).
-	clockStamp    = regexp.MustCompile(`(?m)(?:^|[^:\w\n\r])\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?::[0-9a-fA-F]{2})*`)
+	clockStamp    = regexp.MustCompile(`(?m)(?:^|[^:\w\n\r])\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?::[0-9a-fA-F]{1,4}|::)*`)
 	dateOnlyStamp = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}\b`)
 
 	logLine   = regexp.MustCompile(`(?m)^(?:[^\n]{0,140}(?:\[\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2}|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|\b[A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2}|\b\d{2}:\d{2}:\d{2}[.,]\d+)|(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL|NOTICE)\b)`)

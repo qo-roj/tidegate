@@ -311,3 +311,26 @@ func TestShieldIntermediatePreservesStructure(t *testing.T) {
 		t.Errorf("bracket round-trip changed: %q", got)
 	}
 }
+
+// TestShieldClockGuardKeepsClockShapedIPv6 (deepseek-v4-pro round 2,
+// 2026-11-22, probe-confirmed): a valid IPv6 whose first three groups
+// are two-digit numeric groups looks like a clock to the shield. The
+// tail consumption must classify the whole address as a colon-run
+// (fragment) and leave it untouched so the ipv6 pattern can fire on
+// the full span — including `::` compression and 1-digit groups.
+func TestShieldClockGuardKeepsClockShapedIPv6(t *testing.T) {
+	cases := []struct{ name, in string }{
+		{"compressed", "addr 12:34:56::1 end"},
+		{"mixed groups", "addr 12:34:56:7:89:ab:cd:ef end"},
+	}
+	for _, c := range cases {
+		shielded, restore := content.ShieldTimestamps(c.in)
+		if strings.Contains(shielded, "\x7f") {
+			t.Errorf("[%s] clock-shaped IPv6 got shielded (ipv6 can never fire): %q", c.name, shielded)
+		}
+		if got := restore(shielded); got != c.in {
+			t.Errorf("[%s] round-trip changed: %q", c.name, got)
+		}
+	}
+	// The end-to-end proof is the meter: ipv6 must fire on these.
+}

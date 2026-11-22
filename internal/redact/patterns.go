@@ -144,10 +144,43 @@ func DefaultPatterns() []*Pattern {
 			Category: "IP",
 			Enabled:  true,
 		},
+		// IPv6 — full 8-group form PLUS `::` compressed forms. The original
+		// 8-group-only regex never matched compressed addresses — which is
+		// most real-world IPv6 (`2001:db8::1` leaked whole; surfaced by a
+		// clock-shaped canary, deepseek round 2 + privacy meter,
+		// 2026-11-22). RE2 grammar notes: each `(?:h:){n}` group CONSUMES
+		// its trailing colon, so a compressed form parses as
+		// groups+bare-hex then `::` (a naive `{1,6}::` eats the first
+		// colon of the pair and never matches); and `\b` never sits next
+		// to a bare `:` (a boundary needs a word char on one side), which
+		// is why `::`-LEADING forms need their own guarded pattern below.
+		// Branches: (1) full form; (2) middle `::` (bare hex before it, so
+		// `12:34:56::1` parses whole); (3) trailing `::` (config prefixes
+		// like 2001:db8:1::). MACs (6 groups, no `::`) never match;
+		// clocks have no `::`. Invalid 8-hex-digit tails
+		// (12:34:56::deadbeef) tokenize only through the `::` — the
+		// residue is inert hex.
 		{
 			Name:     "ipv6",
-			Regex:    regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b`),
+			Regex:    regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,6}[0-9a-fA-F]{1,4}::`),
 			Category: "IP",
+			Enabled:  true,
+		},
+		// ipv6_leading — `::`-prefixed forms (::1, ::ffff:1:2). Needs its
+		// own pattern because `\b` cannot anchor before a bare `:`: the
+		// guard `^|[^:\w\n\r]` consumes one preceding non-word char
+		// (space, quote, start of line) and Group extracts ONLY the
+		// address span, the same guard-consume/group-extract idiom the
+		// syslog/accesslog hostname patterns use. The guard is what keeps
+		// C++ off the menu: without it, `std::dec` / `my::cafe` would
+		// tokenize (`::dec` is a leading-colon hex run). Bare `::` alone
+		// (unspecified address) deliberately does not match — it is
+		// punctuation-shaped and appears in code namespaces.
+		{
+			Name:     "ipv6_leading",
+			Regex:    regexp.MustCompile(`(?m)(?:^|[^:\w\n\r])(::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4})\b`),
+			Category: "IP",
+			Group:    1,
 			Enabled:  true,
 		},
 		{
@@ -165,12 +198,18 @@ func DefaultPatterns() []*Pattern {
 		// widens to 19 digits (Krabs round 1, M1): real Maestro/UATP PANs
 		// run that long, and with Luhn gating the wider window costs
 		// nothing — a 19-digit order ID fails the checksum and passes
-		// through. 20+ digit runs still never match (the \b after the
-		// window cannot sit mid-run). Known tradeoff, documented: a
-		// single-digit TYPO in a real PAN fails its own checksum and
-		// passes through unredacted — check-digit gating inherits this
-		// from the format itself; only digit-pair transpositions that
-		// keep Luhn valid (e.g. 09↔90) still tokenize.
+		// through. Known tradeoff, documented: a single-digit TYPO in a
+		// real PAN fails its own checksum and passes through unredacted —
+		// check-digit gating inherits this from the format itself; only
+		// digit-pair transpositions that keep Luhn valid (e.g. 09↔90)
+		// still tokenize. Edge, documented (deepseek round 2, MINOR,
+		// probe-confirmed): 20+ digit runs only stay unmatched when
+		// UNSEPARATED (\b cannot sit mid-run); a SEPARATED 20+ digit run
+		// (`4111 1111 1111 1111 1234`) can match its 16-digit prefix plus
+		// trailing separator, so a Luhn-valid prefix tokenizes and the
+		// 4-digit residue stays visible. PANs never run 20+ digits, so the
+		// residue is inert — no pattern consumes it and nothing sensitive
+		// is 4 visible digits of a non-PAN. Accepted.
 		{
 			Name:     "credit_card",
 			Regex:    regexp.MustCompile(`\b(?:\d[ \-]?){13,19}\b`),
@@ -378,7 +417,7 @@ var patternNames = []string{
 	"api_key_github", "api_key_openai", "api_key_anthropic",
 	"api_key_aws", "api_key_aws_secret", "api_key_google", "api_key_stripe",
 	"api_key_slack", "api_key_gitlab", "bearer_token", "email", "ipv4_private",
-	"ipv4", "ipv6", "mac_address", "credit_card", "ssn_us",
+	"ipv4", "ipv6", "ipv6_leading", "mac_address", "credit_card", "ssn_us",
 	"phone", "hostname_internal", "iban", "passport", "high_entropy_secret",
 	"syslog_hostname", "passwd_username", "accesslog_hostname",
 	"docroot_hostname", "url_hostname",

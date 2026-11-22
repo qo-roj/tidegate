@@ -56,6 +56,9 @@ var proseCanaries = []leak{
 	{"phone_nanp", "(212) 555-0199"},
 	{"ipv4", "203.0.113.42"},
 	{"ipv6", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
+	{"ipv6_compressed", "2001:db8::1"},
+	{"ipv6_clockshape", "12:34:56::1"},
+	{"ipv6_leading", "::1"},
 	{"mac", "02:42:ac:11:00:03"},
 	{"pan_visa", "4111 1111 1111 1111"},
 	{"pan_mc", "5500-0000-0000-0004"},
@@ -67,7 +70,7 @@ var proseCanaries = []leak{
 const proseSrc = `Customer alice.johnson@example.com called from +1 (415) 555-0132
 about order 84721. Backup contact: bob_smith@corp.example.co.uk, (212) 555-0199.
 Their session originated from 203.0.113.42 (device mac 02:42:ac:11:00:03),
-IPv6 tunnel 2001:0db8:85a3:0000:0000:8a2e:0370:7334.
+IPv6 tunnel 2001:0db8:85a3:0000:0000:8a2e:0370:7334, gateway 2001:db8::1, edge node 12:34:56::1, loopback ::1.
 Card on file 4111 1111 1111 1111, alt 5500-0000-0000-0004, SSN 123-45-6789.
 Reproduce with: curl -H "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"
 https://internal-api.corp.example.com/v2/orders?id=84721`
@@ -138,6 +141,7 @@ var envdumpCanaries = []leak{
 	{"dsn_host", "db1.internal.example.com"},
 	{"passwd_user", "svc-deploy:x:"},
 	{"docroot_host", "legacyhost.example.io"},
+	{"ipv6_prefix", "2001:db8:1::"},
 }
 
 var envdumpSrc = `# deployment environment
@@ -148,6 +152,7 @@ export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 export GOOGLE_API_KEY=AIzaSyA1234567890abcdefghijklmnopqrstuv
 export STRIPE_SECRET_KEY=` + stripeCanary + `export AUTH_JWT=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
 export DATABASE_URL=postgresql://appuser:hunter2@db1.internal.example.com:5432/prod
+export IPV6_PREFIX=2001:db8:1::
 svc-deploy:x:1002:1002:Deploy user:/home/svc-deploy:/usr/sbin/nologin
 [Sat Nov 21 10:17:02 2026] [error] [client 203.0.113.55] client denied by server configuration: /var/www/legacyhost.example.io/htdocs/x.php
 -----BEGIN OPENSSH PRIVATE KEY-----
@@ -263,7 +268,7 @@ func TestPrivacyMeterCounts(t *testing.T) {
 		want  []string
 	}{
 		{proseSrc, "prose", []string{
-			"email", "phone", "ipv4", "ipv6", "mac_address",
+			"email", "phone", "ipv4", "ipv6", "ipv6_leading", "mac_address",
 			"credit_card", "ssn_us", "bearer_token", "url_hostname"}},
 		{syslogSrc, "syslog", []string{
 			"syslog_hostname", "ipv4", "email"}},
