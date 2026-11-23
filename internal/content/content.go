@@ -225,6 +225,14 @@ func RedactJSONKeys(src string, fn func(key, value string) string) (string, int)
 		if keyStart < 0 || keyEnd < 0 {
 			continue
 		}
+		// A sensitive key nested inside another sensitive key's object value
+		// ({"password": {..., "secret": ...}}) produces overlapping matches:
+		// the outer rewrite consumed the whole span, so this match's indices
+		// are stale — without this guard the string branch slices
+		// src[last:valueStart+1] with valueStart+1 < last and panics.
+		if keyStart < last {
+			continue
+		}
 		key, err := unquoteJSON(src[keyStart:keyEnd])
 		if err != nil || !IsSensitiveKey(key) {
 			continue

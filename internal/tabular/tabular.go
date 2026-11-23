@@ -671,10 +671,14 @@ func generalizeColumn(header string, values []string, kind colType, opt Options)
 				continue
 			}
 			h := hashBytes(opt.Salt, v)
+			// v4-shaped output (8-4-4-4-12): a reviewer round caught the old
+			// format emitting 3-char version/variant groups, which downstream
+			// UUID parsers reject. Version nibble forced to 4, variant to 8.
+			g3 := hex.EncodeToString(h[6:8])
+			g4 := hex.EncodeToString(h[8:10])
 			values[i] = fmt.Sprintf("%s-%s-4%s-8%s-%s",
 				hex.EncodeToString(h[0:4]), hex.EncodeToString(h[4:6]),
-				hex.EncodeToString(h[6:7]), hex.EncodeToString(h[7:8]),
-				hex.EncodeToString(h[8:14]))
+				g3[1:], g4[1:], hex.EncodeToString(h[10:16]))
 			changed++
 		}
 	case typeURL:

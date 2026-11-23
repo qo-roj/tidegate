@@ -224,3 +224,51 @@ disable = ["url", "date"]
 		t.Errorf("empty lists failed validation: %v", err)
 	}
 }
+
+// TestTabularUnanchoredBracketRegexSurvives closes the round-2 MINOR: an
+// unquoted value that merely STARTS with '[' (a regex character class) was
+// silently stripped to its interior — `keep = [a-z]+_id` became `a-z]+_id`,
+// which Go compiles (bare ']' is a literal) and silently matches nothing.
+// Bracket stripping must fire only when the value is a full bracket list.
+func TestTabularUnanchoredBracketRegexSurvives(t *testing.T) {
+	// canonical comma form, unchanged
+	if got := splitCSVList("url, card"); len(got) != 2 || got[0] != "url" || got[1] != "card" {
+		t.Errorf("canonical comma form: %v", got)
+	}
+	// full bracket list (both ends): stripped, as documented
+	if got := splitCSVList(`["url", "card"]`); len(got) != 2 || got[0] != "url" || got[1] != "card" {
+		t.Errorf("full bracket list: %v", got)
+	}
+	if got := splitCSVList("[url, card]"); len(got) != 2 || got[0] != "url" {
+		t.Errorf("unquoted bracket list: %v", got)
+	}
+	// unanchored bracket (regex character class): must survive BYTE-EXACT
+	for _, re := range []string{`[a-z]+_id`, `[0-9]{3}`, `foo]bar`, `[]ab`} {
+		if got := splitCSVList(re); len(got) != 1 || got[0] != re {
+			t.Errorf("unanchored bracket value %q mangled to %v", re, got)
+		}
+	}
+	// a value that IS a full bracket shape is a list; quoting forces the literal
+	if got := splitCSVList(`"[0-9]"`); len(got) != 1 || got[0] != `[0-9]` {
+		t.Errorf("quoted full-bracket regex: %v", got)
+	}
+	// matching quote pairs are trimmed; unmatched quotes survive
+	if got := splitCSVList(`"url"`); len(got) != 1 || got[0] != "url" {
+		t.Errorf("matching double quotes: %v", got)
+	}
+	if got := splitCSVList(`'url'`); len(got) != 1 || got[0] != "url" {
+		t.Errorf("matching single quotes: %v", got)
+	}
+	if got := splitCSVList(`"foo'`); len(got) != 1 || got[0] != `"foo'` {
+		t.Errorf("unmatched quotes must survive: %v", got)
+	}
+	// end-to-end: the keep regex survives a config load and still compiles
+	cfg := &AppConfig{}
+	applyGatewayBytes(cfg, []byte("[tabular]\nkeep = [a-z]+_id\n"))
+	if len(cfg.Tabular.Keep) != 1 || cfg.Tabular.Keep[0] != `[a-z]+_id` {
+		t.Fatalf("keep after config load = %v", cfg.Tabular.Keep)
+	}
+	if err := cfg.Tabular.Validate(); err != nil {
+		t.Errorf("keep regex failed validation: %v", err)
+	}
+}

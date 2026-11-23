@@ -32,8 +32,13 @@ func randomHex(n int) string {
 	return hex.EncodeToString(buf)[:n]
 }
 
-// randomToken builds a syntactically valid token that has no vault mapping,
-// so it stays redacted but cannot be restored.
+// randomToken builds a syntactically valid token for the store-failure
+// fallback. It carries the StatelessTokenSuffix so it never collides with a
+// vault-backed token. Within the CURRENT request it still round-trips
+// (mapping/reverse are populated, so repeated values dedupe and responses
+// restore it) — restored values only ever travel back to the local agent,
+// so this is a UX property, not a leak path. Across requests it is dead:
+// no vault entry exists to restore it.
 func randomToken(category string) string {
 	return fmt.Sprintf("[TG:%s:0:%s]", category, randomHex(8))
 }

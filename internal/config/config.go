@@ -458,16 +458,24 @@ func applyGatewayBytes(cfg *AppConfig, data []byte) {
 
 // splitCSVList parses a list-valued config entry. Bare comma-separated values
 // are the canonical form; a TOML-style bracket array is also accepted because
-// it is what people write in a .conf file that looks like TOML.
+// it is what people write in a .conf file that looks like TOML. The brackets
+// are stripped ONLY when the value is a full list (starts '[' AND ends ']') —
+// an unquoted regex that merely starts with a character class (`keep = [a-z]+_id`)
+// must survive byte-exact; stripping its interior silently produced a pattern
+// that compiled and matched nothing. Quote trimming likewise requires a
+// matching pair — a stray quote is content, not punctuation.
 func splitCSVList(v string) []string {
 	v = strings.TrimSpace(v)
-	v = strings.TrimPrefix(v, "[")
-	v = strings.TrimSuffix(v, "]")
+	if len(v) >= 2 && v[0] == '[' && v[len(v)-1] == ']' {
+		v = v[1 : len(v)-1]
+	}
 
 	var out []string
 	for _, part := range strings.Split(v, ",") {
 		p := strings.TrimSpace(part)
-		p = strings.TrimSpace(strings.Trim(p, `"'`))
+		if len(p) >= 2 && (p[0] == '"' || p[0] == '\'') && p[len(p)-1] == p[0] {
+			p = p[1 : len(p)-1]
+		}
 		if p != "" {
 			out = append(out, p)
 		}
